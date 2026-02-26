@@ -1,116 +1,28 @@
-:::writing{variant=standard id=38421}
+# Elytra ⚡
 
-Elytra ⚡ — Distributed Serverless Compute Engine
+> Distributed serverless compute engine powered by Rust + WebAssembly
 
-Elytra is an experimental distributed compute platform that lets developers run serverless-style parallel workloads across an elastic worker pool powered by Rust + WebAssembly.
+Elytra is an experimental platform that lets developers run serverless-style parallel workloads across an elastic worker pool. Write a function — Elytra runs it massively parallel on elastic infrastructure, without managing clusters, queues, or MPI.
 
-It combines:
-	•	🧠 Serverless DX (Lambda-like)
-	•	⚡ Rust WASM high-performance kernels
-	•	🌐 Browser & native worker pool (future)
-	•	🧩 Universal sharding engine
-	•	🚀 TurboRepo monorepo setup
+---
 
-⸻
+## What It Does
 
-✨ Vision
+Instead of complex distributed systems primitives, developers use simple APIs:
 
-Write a function → Elytra runs it massively parallel on elastic infrastructure.
+```ts
+elytra.map(data, computeFn)
+elytra.parallelFor(range, fn)
+elytra.reduce(results, reduceFn)
+```
 
-Instead of managing clusters, queues, or MPI, developers use simple primitives like:
-	•	map()
-	•	parallelFor()
-	•	reduce()
+Under the hood, Elytra shards the job, distributes it to workers, executes it in high-performance Rust WASM kernels, and returns the reduced result.
 
-⸻
+---
 
-🏗️ Monorepo Structure
+## Architecture
 
-elytra/
-├─ apps/
-├─ packages/
-│  └─ rust-core/        # Rust → WASM compute kernels
-├─ turbo.json
-├─ package.json
-└─ README.md
-
-Key Package
-
-packages/rust-core
-	•	Rust compute kernels
-	•	Built with wasm-pack
-	•	Exported to JS via ESM
-
-⸻
-
-🦀 Rust Core (WASM)
-
-The Rust core contains high-performance compute functions compiled to WebAssembly.
-
-Build
-
-From packages/rust-core:
-
-npm run build
-
-or dev build:
-
-npm run dev
-
-These run:
-
-"build": "wasm-pack build --target web --no-opt",
-"dev": "wasm-pack build --target web --dev --no-opt"
-
-
-⸻
-
-📦 Exports
-
-From package.json:
-
-"exports": {
-  ".": {
-    "import": "./pkg/rust_core.js",
-    "types": "./pkg/rust_core.d.ts"
-  }
-}
-
-This allows consumers to import the WASM module cleanly.
-
-⸻
-
-🚀 Getting Started
-
-1️⃣ Install dependencies
-
-From repo root:
-
-npm install
-
-
-⸻
-
-2️⃣ Build Rust WASM
-
-cd packages/rust-core
-npm run build
-
-
-⸻
-
-3️⃣ Run the app (example)
-
-From root:
-
-npm run dev
-
-You should see Next.js start (as in your terminal).
-
-⸻
-
-🧠 How Elytra Works (High Level)
-
+```
 User Function
      ↓
 SDK serializes
@@ -126,70 +38,177 @@ Rust WASM executes
 Results reduced
      ↓
 Returned to user
+```
 
+---
 
-⸻
+## Monorepo Structure
 
-🔥 Current Capabilities
-	•	Universal sharding engine
-	•	Rust WASM compute core
-	•	TurboRepo workspace
-	•	Serverless-style job model
-	•	Elastic worker architecture (in progress)
+```
+elytra/
+├── apps/
+│   └── web/                  # Next.js frontend / control plane UI
+├── packages/
+│   ├── rust-core/            # Rust → WASM compute kernels
+│   ├── ui/                   # Shared UI components
+│   ├── eslint-config/        # Shared ESLint config
+│   └── typescript-config/    # Shared TypeScript config
+├── turbo.json
+├── package.json
+└── README.md
+```
 
-⸻
+---
 
-🗺️ Roadmap
+## Getting Started
 
-Near Term
-	•	Worker heartbeat
-	•	Retry & fault tolerance
-	•	Streaming shards
-	•	Adaptive chunk sizing
-	•	WebSocket control plane
+### Prerequisites
 
-Mid Term
-	•	Native desktop agent (Rust/Tauri)
-	•	Worker capability scoring
-	•	Speculative execution
-	•	Secure sandboxing
+- Node.js 22+
+- Rust + Cargo ([install](https://rustup.rs))
+- wasm-pack
 
-Long Term
-	•	AI-assisted scheduler
-	•	GPU/WebGPU support
-	•	Global edge routing
-	•	Marketplace economics
+```bash
+cargo install wasm-pack
+```
 
-⸻
+### 1. Install dependencies
 
-⚠️ Experimental Status
+```bash
+npm install
+```
 
-Elytra is currently experimental and under active development.
+### 2. Build Rust WASM core
 
-Expect:
-	•	breaking changes
-	•	evolving APIs
-	•	incomplete fault tolerance
+```bash
+cd packages/rust-core
+npm run build
+```
 
-⸻
+### 3. Run the dev server
 
-🤝 Contributing
+From the repo root:
 
-Contributions, ideas, and experiments are welcome.
+```bash
+npm run dev
+```
 
-Planned areas needing work:
-	•	scheduler intelligence
-	•	worker reliability
-	•	WASM performance paths
-	•	developer DX
+The Next.js app starts at `http://localhost:3000`.
 
-⸻
+---
 
-📜 License
+## Rust Core (`packages/rust-core`)
+
+High-performance compute functions written in Rust, compiled to WebAssembly via `wasm-pack`.
+
+### Build scripts
+
+| Command | Description |
+|---|---|
+| `npm run build` | Release build (optimized) |
+| `npm run dev` | Dev build (faster compile, larger binary) |
+
+Both run `wasm-pack build --target web --no-opt`.
+
+### Adding a compute function
+
+In `packages/rust-core/src/lib.rs`:
+
+```rust
+use wasm_bindgen::prelude::*;
+
+#[wasm_bindgen]
+pub fn my_function(input: u32) -> u32 {
+    // your logic here
+    input * 2
+}
+```
+
+Rebuild after any changes:
+
+```bash
+npm run build
+```
+
+### Consuming from TypeScript
+
+```ts
+"use client";
+import { useEffect, useState } from "react";
+
+export default function Page() {
+  const [result, setResult] = useState<number | null>(null);
+
+  useEffect(() => {
+    import("rust-core").then(({ default: init, my_function }) => {
+      init().then(() => setResult(my_function(21)));
+    });
+  }, []);
+
+  return <div>{result}</div>;
+}
+```
+
+---
+
+## Current Status
+
+| Feature | Status |
+|---|---|
+| Rust WASM compute core | ✅ Working |
+| TurboRepo monorepo | ✅ Working |
+| Universal sharding engine | ✅ Working |
+| Serverless-style job model | ✅ Working |
+| Elastic worker architecture | 🚧 In progress |
+| Worker heartbeat & retry | 🚧 Planned |
+
+---
+
+## Roadmap
+
+**Near term**
+- Worker heartbeat and fault tolerance
+- Retry logic and streaming shards
+- Adaptive chunk sizing
+- WebSocket control plane
+
+**Mid term**
+- Native desktop agent (Rust + Tauri)
+- Worker capability scoring
+- Speculative execution
+- Secure sandboxing
+
+**Long term**
+- AI-assisted scheduler
+- GPU / WebGPU support
+- Global edge routing
+- Marketplace economics
+
+---
+
+## Contributing
+
+Elytra is experimental and under active development — contributions, ideas, and experiments are welcome.
+
+Areas that need the most work:
+
+- Scheduler intelligence
+- Worker reliability and fault tolerance
+- WASM performance paths
+- Developer experience and SDK design
+
+---
+
+## ⚠️ Experimental
+
+Elytra is not production-ready. Expect breaking changes, evolving APIs, and incomplete fault tolerance. Use it to experiment, not in critical systems.
+
+---
+
+## License
 
 TBD
 
-⸻
+---
 
-Elytra — Serverless parallel compute without the cluster.
-:::
+*Elytra — serverless parallel compute without the cluster.*
