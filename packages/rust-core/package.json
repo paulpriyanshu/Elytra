@@ -1,0 +1,15 @@
+{
+  "name": "rust-core",
+  "version": "0.0.0",
+  "private": true,
+  "exports": {
+    ".": {
+      "import": "./pkg/rust_core.js",
+      "types": "./pkg/rust_core.d.ts"
+    }
+  },
+  "scripts": {
+  "build": "wasm-pack build --target web --no-opt",
+  "dev": "wasm-pack build --target web --dev --no-opt"
+}
+}
