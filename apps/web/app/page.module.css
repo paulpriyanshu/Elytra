@@ -184,3 +184,131 @@ button.secondary {
     filter: invert();
   }
 }
+
+/* ================================ */
+/* 🔥 Computation Dashboard Styles */
+/* ================================ */
+
+.dashboard {
+  width: 100%;
+  max-width: 800px;
+  background: var(--gray-alpha-100);
+  border-radius: 24px;
+  padding: 32px;
+  border: 1px solid var(--gray-alpha-200);
+  backdrop-filter: blur(12px);
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+  margin-top: 40px;
+}
+
+.metricsGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 16px;
+}
+
+.metricCard {
+  background: var(--background);
+  padding: 16px;
+  border-radius: 16px;
+  border: 1px solid var(--gray-alpha-200);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.metricValue {
+  font-size: 24px;
+  font-weight: 700;
+  font-family: var(--font-geist-mono);
+}
+
+.metricLabel {
+  font-size: 12px;
+  color: #666;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.workerGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+  gap: 12px;
+}
+
+.workerTile {
+  background: var(--background);
+  padding: 12px;
+  border-radius: 12px;
+  border: 1px solid var(--gray-alpha-200);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  transition: transform 0.2s, box-shadow 0.2s;
+  position: relative;
+  overflow: hidden;
+}
+
+.workerTile.working {
+  border-color: #0070f3;
+  box-shadow: 0 0 10px rgba(0, 112, 243, 0.2);
+}
+
+.workerTile.working::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 2px;
+  background: #0070f3;
+  animation: scanning 1.5s infinite linear;
+}
+
+@keyframes scanning {
+  0% { transform: translateY(-100%); }
+  100% { transform: translateY(120px); }
+}
+
+.workerTile.done {
+  border-color: #00ea64;
+}
+
+.workerId {
+  font-size: 10px;
+  font-family: var(--font-geist-mono);
+  color: #888;
+}
+
+.workerStatus {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+}
+
+.workerTime {
+  font-size: 10px;
+  font-family: var(--font-geist-mono);
+}
+
+.statusIndicator {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+  margin-right: 6px;
+}
+
+.idle .statusIndicator { background: #888; }
+.working .statusIndicator { 
+  background: #0070f3; 
+  animation: pulse 1s infinite alternate;
+}
+.done .statusIndicator { background: #00ea64; }
+
+@keyframes pulse {
+  0% { opacity: 0.5; }
+  100% { opacity: 1; transform: scale(1.2); }
+}

@@ -1,0 +1,20 @@
+{
+    "name": "@elytra/runtime",
+    "version": "0.1.0",
+    "main": "src/index.ts",
+    "types": "src/index.ts",
+    "exports": {
+        ".": "./src/index.ts",
+        "./*": "./src/*.ts",
+        "./workers/*": "./src/workers/*.ts"
+    },
+    "scripts": {
+        "build": "tsc"
+    },
+    "dependencies": {
+        "rust-core": "*"
+    },
+    "devDependencies": {
+        "typescript": "^5.0.0"
+    }
+}
