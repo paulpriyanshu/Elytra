@@ -1,11 +1,27 @@
 import type { Op } from "../dataset";
+import { tableFromIPC } from "apache-arrow";
 
 self.onmessage = async (e: MessageEvent) => {
     try {
-        const { id, data, ops } = e.data;
+        const { id, data, ops, range, isIpc } = e.data;
 
-        // The data is already a pre-sliced chunk
-        let chunk = data;
+        let chunk: any[] = [];
+        let lastProgressTime = 0;
+
+        if (isIpc && data instanceof ArrayBuffer) {
+            // Expensive parsing happens here in parallel!
+            const table = tableFromIPC(new Uint8Array(data));
+            const fields = table.schema.fields.map(f => f.name);
+
+            // Only extract the requested range
+            const slice = table.slice(range.start, range.end);
+            chunk = slice.toArray().map(row => {
+                const j = (row as any).toJSON();
+                return fields.map(f => j[f]);
+            });
+        } else {
+            chunk = data;
+        }
 
         // Build functions from string representation once per chunk
         const compiledOps = ops.map((op: Op) => {
@@ -34,14 +50,19 @@ self.onmessage = async (e: MessageEvent) => {
                     chunk = chunk.reduce(op.compiledFn, op.initialValue) as any;
                 }
 
-                self.postMessage({
-                    id,
-                    ok: true,
-                    type: "progress",
-                    step: i + 1,
-                    totalSteps: totalOps,
-                    operation: op.type
-                });
+                // Throttle progress updates: only send every 100ms or if it's the last operation
+                const now = Date.now();
+                if (i === totalOps - 1 || !lastProgressTime || now - lastProgressTime > 100) {
+                    self.postMessage({
+                        id,
+                        ok: true,
+                        type: "progress",
+                        step: i + 1,
+                        totalSteps: totalOps,
+                        operation: op.type
+                    });
+                    lastProgressTime = now;
+                }
             }
         }
 

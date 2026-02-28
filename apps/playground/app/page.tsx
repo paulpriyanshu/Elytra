@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect } from "react";
-import { Elytra, executePipeline } from "@elytra/runtime";
+import { Elytra, executePipeline, executeParquetPipeline } from "@elytra/runtime";
 
 export default function Page() {
     const [code, setCode] = useState(`const TOTAL_ITEMS = 1_000_000;
@@ -22,14 +22,21 @@ return result;`);
     const [datasetId, setDatasetId] = useState<string | null>(null);
     const [availableDatasets, setAvailableDatasets] = useState<any[]>([]);
     const [uploading, setUploading] = useState(false);
+    const [uploadProgress, setUploadProgress] = useState(0);
 
     const addNetworkLog = (msg: string) => {
         setNetworkLogs(prev => [msg, ...prev].slice(0, 10));
     };
 
+    // 🌐 Dynamic Backend logic
+    const isLocal = typeof window !== "undefined" && (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1");
+    const backendUrl = isLocal
+        ? "http://localhost:3005"
+        : `https://testing3.coryfi.com`;
+
     const fetchDatasets = async () => {
         try {
-            const res = await fetch("http://localhost:3005/api/datasets");
+            const res = await fetch(`${backendUrl}/api/datasets`);
             if (res.ok) {
                 const data = await res.json();
                 setAvailableDatasets(data);
@@ -48,9 +55,12 @@ return result;`);
         if (!file) return;
 
         setUploading(true);
+        setUploadProgress(0);
         addNetworkLog(`Uploading ${file.name} to network...`);
         try {
-            const dataset = await Elytra.uploadFile(file);
+            const dataset = await Elytra.uploadFile(file, (p) => {
+                setUploadProgress(p);
+            });
             const newId = dataset.datasetId!;
             setDatasetId(newId);
             fetchDatasets();
@@ -119,7 +129,7 @@ return result;`;
         if (!confirm("Are you sure you want to delete this dataset?")) return;
 
         try {
-            const res = await fetch(`http://localhost:3005/api/datasets/${id}`, {
+            const res = await fetch(`${backendUrl}/api/datasets/${id}`, {
                 method: "DELETE"
             });
             if (res.ok) {
@@ -133,10 +143,16 @@ return result;`;
     };
 
     useEffect(() => {
-        const ws = new WebSocket("ws://localhost:3005");
+        Elytra.configure({ backendUrl });
+
+        const wsUrl = isLocal
+            ? "ws://localhost:3005?role=controller"
+            : `wss://testing3.coryfi.com?role=controller`;
+
+        const ws = new WebSocket(wsUrl);
 
         ws.onopen = () => {
-            addNetworkLog("Connected to Control Plane Network");
+            addNetworkLog(`Connected to Control Plane Network (${backendUrl})`);
         };
 
         ws.onmessage = async (event) => {
@@ -148,35 +164,8 @@ return result;`;
                 return;
             }
 
-            if (message.type === "execute_chunk") {
-                addNetworkLog(`Self-Executing Chunk ${message.chunkId}`);
-                try {
-                    const res = await executePipeline(message.data, message.ops, (threadId, status, detail) => {
-                        ws.send(JSON.stringify({
-                            type: "worker_progress",
-                            jobId: message.jobId,
-                            chunkId: message.chunkId,
-                            threadId,
-                            status,
-                            ...detail
-                        }));
-                    });
-
-                    ws.send(JSON.stringify({
-                        type: "chunk_result",
-                        jobId: message.jobId,
-                        chunkId: message.chunkId,
-                        result: res
-                    }));
-                } catch (error) {
-                    ws.send(JSON.stringify({
-                        type: "chunk_error",
-                        jobId: message.jobId,
-                        chunkId: message.chunkId,
-                        error: (error as Error).message
-                    }));
-                }
-            }
+            // Note: Playground no longer self-executes chunks.
+            // It only receives progress updates and job completions.
         };
 
         return () => ws.close();
@@ -270,6 +259,18 @@ return result;`;
                             {running && <span className="runningTag">Executing...</span>}
                         </div>
                     </div>
+
+                    {uploading && (
+                        <div style={{ marginTop: -12 }}>
+                            <div style={{ display: "flex", justifyContent: "space-between", fontSize: "0.8rem", color: "#aaa", marginBottom: 4 }}>
+                                <span>Uploading Dataset...</span>
+                                <span>{uploadProgress}%</span>
+                            </div>
+                            <div className="progressContainer">
+                                <div className="progressBar" style={{ width: `${uploadProgress}%` }} />
+                            </div>
+                        </div>
+                    )}
 
                     <textarea
                         className="editor"

@@ -1,3 +1,3 @@
 export { Elytra, Dataset } from "./dataset";
 export type { Op } from "./dataset";
-export { executePipeline } from "./executor";
+export { executePipeline, executeParquetPipeline } from "./executor";

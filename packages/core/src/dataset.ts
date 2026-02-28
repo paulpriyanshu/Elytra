@@ -1,5 +1,5 @@
 import { executePipeline } from "./executor";
-import { StreamUploader } from "./uploader";
+import { R2Uploader } from "./r2-uploader";
 
 export type Op =
     | { type: "map"; fn: string }
@@ -65,6 +65,34 @@ export class Dataset<T> {
 }
 
 export class Elytra {
+    private static _backendUrl = "http://localhost:3005";
+    private static _config = {
+        r2AccountId: "4dffa334f65a3162f5bd6372de42759f",
+        r2AccessKeyId: "e964b7b6440321b7b729dd89206f217a",
+        r2SecretAccessKey: "9bc4aed8e61ce289fb9b3be5f034c2d8f8993843b67904fbb0102ff45b23df97",
+        r2BucketName: "elytra-bucket",
+    };
+
+    static configure(config: {
+        backendUrl?: string,
+        r2AccountId?: string,
+        r2AccessKeyId?: string,
+        r2SecretAccessKey?: string,
+        r2BucketName?: string
+    }) {
+        if (config.backendUrl) this._backendUrl = config.backendUrl;
+        if (config.r2AccountId) this._config.r2AccountId = config.r2AccountId;
+        if (config.r2AccessKeyId) this._config.r2AccessKeyId = config.r2AccessKeyId;
+        if (config.r2SecretAccessKey) this._config.r2SecretAccessKey = config.r2SecretAccessKey;
+        if (config.r2BucketName) this._config.r2BucketName = config.r2BucketName;
+
+        console.log(`[Elytra] Configured`);
+    }
+
+    static get backendUrl() {
+        return this._backendUrl;
+    }
+
     static dataset<T>(data: T[]) {
         return new Dataset<T>(data);
     }
@@ -74,7 +102,7 @@ export class Elytra {
     }
 
     static async upload(data: any[]) {
-        const res = await fetch("http://localhost:3005/api/start-upload", {
+        const res = await fetch(`${this.backendUrl}/api/start-upload`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ name: "json_upload_" + Date.now() })
@@ -82,27 +110,35 @@ export class Elytra {
         if (!res.ok) throw new Error("Start upload failed");
         const { uploadId } = await res.json();
 
-        // This is a simple implementation for small arrays, 
-        // for large arrays we should also use streaming.
-        // For now, let's keep it simple or implement a JSON uploader too.
         return new Dataset<any>([], [], uploadId);
     }
 
-    static async uploadFile(file: File) {
-        // 1. Handshake
-        const res = await fetch("http://localhost:3005/api/start-upload", {
+    static async uploadFile(file: File, onProgress?: (p: number) => void) {
+        const uploader = new R2Uploader(
+            this._config.r2AccountId,
+            this._config.r2AccessKeyId,
+            this._config.r2SecretAccessKey,
+            this._config.r2BucketName
+        );
+
+        const key = `${Date.now()}-${file.name}`;
+        await uploader.upload(file, key, onProgress);
+
+        // Notify server to convert to parquet
+        const res = await fetch(`${this.backendUrl}/api/register-dataset`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ name: file.name })
+            body: JSON.stringify({
+                name: file.name,
+                s3Key: key,
+                bucket: this._config.r2BucketName
+            })
         });
-        if (!res.ok) throw new Error("Start upload failed");
-        const { uploadId } = await res.json();
 
-        // 2. Stream and Upload
-        const uploader = new StreamUploader(file, uploadId);
-        await uploader.upload();
+        if (!res.ok) throw new Error("Dataset registration failed");
+        const { datasetId } = await res.json();
 
-        return new Dataset<any>([], [], uploadId);
+        return new Dataset<any>([], [], datasetId);
     }
 
     static async run<T>(config: {
@@ -111,15 +147,11 @@ export class Elytra {
         datasetId?: string,
         pipeline: (d: Dataset<any>) => Dataset<T>
     }) {
-        // Build the pipeline ops
         const initialDataset = new Dataset<any>([]);
         const finalDataset = config.pipeline(initialDataset);
-
-        // Final dataset ops contain the operations we need to send
         const ops = (finalDataset as any).ops;
 
-        // Submit job to Control Plane
-        const res = await fetch("http://localhost:3005/api/jobs", {
+        const res = await fetch(`${this.backendUrl}/api/jobs`, {
             method: "POST",
             headers: {
                 "Content-Type": "application/json"

@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect } from "react";
-import { Elytra, executePipeline } from "@elytra/runtime";
+import { Elytra, executePipeline, executeParquetPipeline } from "@elytra/runtime";
 
 export default function Page() {
   const [threads, setThreads] = useState<any[]>(Array(8).fill({ status: "idle" }));
@@ -16,50 +16,89 @@ export default function Page() {
   };
 
   useEffect(() => {
-    const ws = new WebSocket("ws://localhost:3005");
+    // 🌐 Dynamic Backend logic for Cloudflare Tunnels
+    const isLocal = window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1";
+    const protocol = window.location.protocol === "https:" ? "https" : "http";
+    const wsProtocol = protocol === "https" ? "wss" : "ws";
+
+    // Detect backend URL based on the current tunnel or localhost
+    const backendUrl = isLocal
+      ? "http://localhost:3005"
+      : `https://testing3.coryfi.com`; // Based on user's tunnel config
+
+    Elytra.configure({ backendUrl });
+
+    const wsUrl = isLocal
+      ? "ws://localhost:3005?role=worker"
+      : `wss://testing3.coryfi.com?role=worker`;
+
+    const ws = new WebSocket(wsUrl);
 
     ws.onopen = () => {
-      addLog("Connected to Control Plane");
+      addLog(`Connected to Control Plane (${backendUrl})`);
+    };
+
+    const jobQueue: any[] = [];
+    let isProcessing = false;
+
+    const processQueue = async () => {
+      if (isProcessing || jobQueue.length === 0) return;
+      isProcessing = true;
+      const { message, ws } = jobQueue.shift();
+
+      const isParquet = message.type === "execute_parquet_chunk";
+      addLog(`Processing job ${message.jobId} (${isParquet ? 'Parquet' : 'CSV'} Chunk ${message.chunkId})...`);
+
+      try {
+        const progressCb = (threadId: number, status: string, detail?: any) => {
+          setThreads(prev => {
+            const next = [...prev];
+            next[threadId] = { status, ...detail };
+            return next;
+          });
+
+          ws.send(JSON.stringify({
+            type: "worker_progress",
+            jobId: message.jobId,
+            chunkId: message.chunkId,
+            threadId,
+            status,
+            ...detail
+          }));
+        };
+
+        const result = isParquet
+          ? await executeParquetPipeline(message.parquetUrl, message.rowGroupId, message.ops, progressCb)
+          : await executePipeline(message.data, message.ops, progressCb);
+
+        addLog(`Completed chunk ${message.chunkId}`);
+        ws.send(JSON.stringify({
+          type: "chunk_result",
+          jobId: message.jobId,
+          chunkId: message.chunkId,
+          result
+        }));
+      } catch (error) {
+        addLog(`Error in chunk ${message.chunkId}: ${error}`);
+        ws.send(JSON.stringify({
+          type: "chunk_error",
+          jobId: message.jobId,
+          chunkId: message.chunkId,
+          error: (error as Error).message
+        }));
+      } finally {
+        isProcessing = false;
+        processQueue();
+      }
     };
 
     ws.onmessage = async (event) => {
       const message = JSON.parse(event.data);
-      if (message.type === "execute_chunk") {
-        addLog(`Received job ${message.jobId} (Chunk ${message.chunkId})`);
-        try {
-          const result = await executePipeline(message.data, message.ops, (threadId, status, detail) => {
-            setThreads(prev => {
-              const next = [...prev];
-              next[threadId] = { status, ...detail };
-              return next;
-            });
 
-            ws.send(JSON.stringify({
-              type: "worker_progress",
-              jobId: message.jobId,
-              chunkId: message.chunkId,
-              threadId,
-              status,
-              ...detail
-            }));
-          });
-
-          addLog(`Completed chunk ${message.chunkId}`);
-          ws.send(JSON.stringify({
-            type: "chunk_result",
-            jobId: message.jobId,
-            chunkId: message.chunkId,
-            result
-          }));
-        } catch (error) {
-          addLog(`Error in chunk ${message.chunkId}: ${error}`);
-          ws.send(JSON.stringify({
-            type: "chunk_error",
-            jobId: message.jobId,
-            chunkId: message.chunkId,
-            error: (error as Error).message
-          }));
-        }
+      if (message.type === "execute_chunk" || message.type === "execute_parquet_chunk") {
+        addLog(`Enqueued job ${message.jobId} (Chunk ${message.chunkId})`);
+        jobQueue.push({ message, ws });
+        processQueue();
       }
     };
 

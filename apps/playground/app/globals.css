@@ -33,6 +33,7 @@ body {
   margin-bottom: 20px;
   background: linear-gradient(135deg, #fff 0%, #a5a5a5 100%);
   -webkit-background-clip: text;
+  background-clip: text;
   -webkit-text-fill-color: transparent;
   letter-spacing: -0.02em;
 }
@@ -173,9 +174,17 @@ body {
 }
 
 @keyframes pulse {
-  0% { opacity: 0.6; }
-  50% { opacity: 1; }
-  100% { opacity: 0.6; }
+  0% {
+    opacity: 0.6;
+  }
+
+  50% {
+    opacity: 1;
+  }
+
+  100% {
+    opacity: 0.6;
+  }
 }
 
 .runningTag {
@@ -186,4 +195,20 @@ body {
   font-size: 12px;
   font-weight: 600;
   animation: pulse 2s infinite;
+}
+
+.progressContainer {
+  width: 100%;
+  height: 6px;
+  background: rgba(255, 255, 255, 0.05);
+  border-radius: 100px;
+  overflow: hidden;
+  margin-top: 12px;
+}
+
+.progressBar {
+  height: 100%;
+  background: var(--primary);
+  transition: width 0.3s ease;
+  box-shadow: 0 0 10px var(--primary-glow);
 }

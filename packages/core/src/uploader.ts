@@ -3,7 +3,7 @@ import { Elytra } from "./dataset";
 export class StreamUploader {
     private workers: Worker[] = [];
     private maxParallelUploads = typeof navigator !== "undefined" ? Math.max(2, (navigator.hardwareConcurrency || 4)) : 4;
-    private serverUrl = "http://localhost:3005";
+    private serverUrl = Elytra.backendUrl;
 
     constructor(private file: File, private uploadId: string) {
         // Initialize workers based on hardware concurrency
