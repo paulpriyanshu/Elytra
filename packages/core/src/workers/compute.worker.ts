@@ -3,66 +3,80 @@ import { tableFromIPC } from "apache-arrow";
 
 self.onmessage = async (e: MessageEvent) => {
     try {
-        const { id, data, ops, range, isIpc } = e.data;
+        const { id, data, ops, range, isIpc, batchSize } = e.data;
 
-        let chunk: any[] = [];
-        let lastProgressTime = 0;
-
-        if (isIpc && data instanceof ArrayBuffer) {
-            // Expensive parsing happens here in parallel!
-            const table = tableFromIPC(new Uint8Array(data));
-            const fields = table.schema.fields.map(f => f.name);
-
-            // Only extract the requested range
-            const slice = table.slice(range.start, range.end);
-            chunk = slice.toArray().map(row => {
-                const j = (row as any).toJSON();
-                return fields.map(f => j[f]);
-            });
-        } else {
-            chunk = data;
-        }
-
-        // Build functions from string representation once per chunk
+        const BATCH_SIZE = batchSize || 100000;
         const compiledOps = ops.map((op: Op) => {
             if (op.type === "map" || op.type === "filter" || op.type === "reduce") {
-                // Construct the function from the string representation
-                // Handle arrow functions or normal functions
-                const fnStr = op.fn;
-                // A robust way to eval a function string:
-                const fn = new Function("return " + fnStr)();
+                const fn = new Function("return " + op.fn)();
                 return { ...op, compiledFn: fn };
             }
             return op;
         });
 
-        if (Array.isArray(chunk)) {
-            const totalOps = compiledOps.length;
-            for (let i = 0; i < totalOps; i++) {
-                const op = compiledOps[i];
-                if (op.type === "map") {
-                    chunk = chunk.map(op.compiledFn);
-                } else if (op.type === "filter") {
-                    chunk = chunk.filter(op.compiledFn);
-                } else if (op.type === "count") {
-                    chunk = chunk.length as any;
-                } else if (op.type === "reduce") {
-                    chunk = chunk.reduce(op.compiledFn, op.initialValue) as any;
+        let finalChunk: any = null;
+        const totalRows = isIpc && data instanceof ArrayBuffer ? 0 : (Array.isArray(data) ? data.length : 0);
+
+        if (isIpc && data instanceof ArrayBuffer) {
+            const table = tableFromIPC(new Uint8Array(data));
+            const fields = table.schema.fields.map(f => f.name);
+            const slice = table.slice(range.start, range.end);
+            const numRows = slice.numRows;
+
+            // Direct Vector Access
+            const columns = fields.map(f => slice.getChild(f));
+            const numFields = fields.length;
+            const reusableRow: any[] = new Array(numFields);
+
+            for (let b = 0; b < numRows; b += BATCH_SIZE) {
+                const end = Math.min(b + BATCH_SIZE, numRows);
+                let batch: any[] = [];
+
+                // Optimized Extract
+                for (let i = b; i < end; i++) {
+                    for (let c = 0; c < numFields; c++) {
+                        reusableRow[c] = columns[c]?.get(i) ?? null;
+                    }
+                    batch.push([...reusableRow]);
                 }
 
-                // Throttle progress updates: only send every 100ms or if it's the last operation
-                const now = Date.now();
-                if (i === totalOps - 1 || !lastProgressTime || now - lastProgressTime > 100) {
-                    self.postMessage({
-                        id,
-                        ok: true,
-                        type: "progress",
-                        step: i + 1,
-                        totalSteps: totalOps,
-                        operation: op.type
-                    });
-                    lastProgressTime = now;
+                // Process
+                for (const op of compiledOps) {
+                    if (op.type === "map") {
+                        batch = batch.map(op.compiledFn);
+                    } else if (op.type === "filter") {
+                        batch = batch.filter(op.compiledFn);
+                    } else if (op.type === "count") {
+                        finalChunk = (finalChunk || 0) + batch.length;
+                        batch = [];
+                    } else if (op.type === "reduce") {
+                        finalChunk = batch.reduce(op.compiledFn, finalChunk !== null ? finalChunk : op.initialValue);
+                        batch = [];
+                    }
                 }
+
+                if (batch.length > 0) {
+                    if (finalChunk === null) finalChunk = [];
+                    if (Array.isArray(finalChunk)) {
+                        for (const item of batch) finalChunk.push(item);
+                    }
+                }
+
+                self.postMessage({
+                    id, ok: true, type: "progress",
+                    current: end,
+                    total: numRows,
+                    percent: Math.round((end / numRows) * 100)
+                });
+            }
+        } else {
+            // Fallback for non-IPC or simple arrays (unlikely for massive mobile jobs)
+            finalChunk = data;
+            for (const op of compiledOps) {
+                if (op.type === "map") finalChunk = finalChunk.map(op.compiledFn);
+                else if (op.type === "filter") finalChunk = finalChunk.filter(op.compiledFn);
+                else if (op.type === "count") finalChunk = finalChunk.length as any;
+                else if (op.type === "reduce") finalChunk = finalChunk.reduce(op.compiledFn, op.initialValue) as any;
             }
         }
 
@@ -70,7 +84,7 @@ self.onmessage = async (e: MessageEvent) => {
             id,
             ok: true,
             type: "done",
-            result: chunk,
+            result: finalChunk,
         });
     } catch (err: any) {
         self.postMessage({

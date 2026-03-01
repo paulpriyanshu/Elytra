@@ -18,7 +18,7 @@ fs.mkdirSync(DATA_ROOT, { recursive: true });
 const R2_ACCOUNT_ID = process.env.R2_ACCOUNT_ID || "4dffa334f65a3162f5bd6372de42759f";
 const R2_ACCESS_KEY_ID = process.env.R2_ACCESS_KEY_ID || "e964b7b6440321b7b729dd89206f217a";
 const R2_SECRET_ACCESS_KEY = process.env.R2_SECRET_ACCESS_KEY || "9bc4aed8e61ce289fb9b3be5f034c2d8f8993843b67904fbb0102ff45b23df97";
-const R2_BUCKET_NAME = process.env.R2_BUCKET_NAME || "ai-extension";
+const R2_BUCKET_NAME = process.env.R2_BUCKET_NAME || "elytra-bucket";
 const R2_PUBLIC_URL = process.env.R2_PUBLIC_URL || "https://elytra.aradhangini.com";
 
 const s3Client = new S3Client({
@@ -40,11 +40,14 @@ let db: Database;
         SET s3_access_key_id='${R2_ACCESS_KEY_ID}';
         SET s3_secret_access_key='${R2_SECRET_ACCESS_KEY}';
         SET s3_url_style='path';
-        SET max_memory='4GB';
+        SET memory_limit='8GB';
         SET threads=8;
+        SET enable_progress_bar=true;
+        SET progress_bar_time=100;
         SET preserve_insertion_order=false;
+        SET temp_directory='/tmp/duckdb';
     `);
-    console.log("🦆 DuckDB initialized with S3 support");
+    console.log("🦆 DuckDB initialized with S3 support and immediate progress bar enabled");
 })();
 
 // ===============================
@@ -116,18 +119,32 @@ app.post("/api/register-dataset", async (req, res) => {
 
     try {
         const inputPath = `s3://${bucket}/${s3Key}`;
-        const parquetKey = `parquet/${uploadId}.parquet`;
-        const outputPath = `s3://${bucket}/${parquetKey}`;
+        const isParquet = s3Key.toLowerCase().endsWith(".parquet");
 
-        console.log(`Converting ${inputPath} to Parquet...`);
-        const start = Date.now();
+        let parquetKey = s3Key;
+        let outputPath = inputPath;
 
-        await db.all(`
-            COPY (SELECT * FROM read_csv_auto('${inputPath}')) 
-            TO '${outputPath}' (FORMAT 'PARQUET', ROW_GROUP_SIZE 100000)
-        `);
+        if (!isParquet) {
+            parquetKey = `parquet/${uploadId}.parquet`;
+            outputPath = `s3://${bucket}/${parquetKey}`;
 
-        console.log(`Conversion took ${((Date.now() - start) / 1000).toFixed(2)}s`);
+            console.log(`Converting ${inputPath} to Parquet...`);
+            const start = Date.now();
+
+            await db.all(`
+                COPY (SELECT * FROM read_csv('${inputPath}', 
+                    AUTO_DETECT=TRUE,
+                    HEADER=TRUE,
+                    DELIM=',',
+                    SAMPLE_SIZE=-1
+                )) 
+                TO '${outputPath}' (FORMAT 'PARQUET', ROW_GROUP_SIZE 1000000)
+            `);
+
+            console.log(`Conversion took ${((Date.now() - start) / 1000).toFixed(2)}s`);
+        } else {
+            console.log(`Registering existing Parquet file: ${inputPath}`);
+        }
 
         const metadata: any[] = await db.all(`
             SELECT row_group_id, row_group_num_rows as num_rows
@@ -142,7 +159,7 @@ app.post("/api/register-dataset", async (req, res) => {
         }));
 
         const meta: DatasetMeta = {
-            name: name || "dataset_" + Date.now(),
+            name: name || (isParquet ? s3Key.split('/').pop()! : "dataset_" + Date.now()),
             timestamp: Date.now(),
             s3Key: parquetKey,
             bucket: bucket,
@@ -158,8 +175,10 @@ app.post("/api/register-dataset", async (req, res) => {
         console.log(`✅ Registered dataset: ${meta.name} (${uploadId}) with ${rowGroups.length} row groups`);
         res.json({ datasetId: uploadId, rowGroupCount: rowGroups.length });
     } catch (e: any) {
-        console.error("Dataset registration failed:", e);
-        res.status(500).json({ error: e.message });
+        console.error("❌ Dataset registration failed!");
+        console.error("Error Detail:", e);
+        if (e.message) console.error("Message:", e.message);
+        res.status(500).json({ error: e.message || "Unknown error during registration" });
     }
 });
 
@@ -172,6 +191,21 @@ app.get("/api/datasets", (req, res) => {
         format: meta.format
     }));
     res.json(list);
+});
+
+app.delete("/api/datasets/:id", (req, res) => {
+    const { id } = req.params;
+    if (datasets.has(id)) {
+        datasets.delete(id);
+        const metaDir = path.join(DATA_ROOT, id);
+        if (fs.existsSync(metaDir)) {
+            fs.rmSync(metaDir, { recursive: true, force: true });
+        }
+        console.log(`🗑️ Deleted dataset: ${id}`);
+        res.json({ success: true });
+    } else {
+        res.status(404).json({ error: "Dataset not found" });
+    }
 });
 
 // ===============================
@@ -203,6 +237,9 @@ wss.on("connection", (ws, req) => {
         activeWorkers.add(ws);
         console.log(`[Control Plane] Worker connected from ${remoteIp}. Total workers: ${activeWorkers.size}`);
     }
+
+    const isMobile = url.searchParams.get("isMobile") === "true";
+    (ws as any).isMobile = isMobile;
 
     ws.on("message", (message) => {
         try {
@@ -298,10 +335,45 @@ app.post("/api/jobs", async (req, res) => {
                 completedChunks: 0
             });
 
-            tasks.forEach((task, index) => {
-                const worker = workerArray[index % workerArray.length]!;
+            // Weighted Distribution Strategy: 4:1 Ratio for Large Chunks
+            const workers = Array.from(activeWorkers);
+            const desktopWorkers = workers.filter(w => !(w as any).isMobile);
+            const mobileWorkers = workers.filter(w => (w as any).isMobile);
+
+            let desktopIdx = 0;
+            let mobileIdx = 0;
+            let largeChunkCount = 0;
+
+            tasks.forEach((task) => {
+                const chunkMeta = dataset.rowGroups[task.chunkId];
+                const isLargeChunk = chunkMeta && chunkMeta.rowCount > 500_000;
+
+                let worker: WebSocket;
+
+                if (isLargeChunk) {
+                    largeChunkCount++;
+                    // Every 4th large chunk (index 3, 7, etc.) goes to mobile IF available
+                    if (largeChunkCount % 4 === 0 && mobileWorkers.length > 0) {
+                        worker = mobileWorkers[mobileIdx % mobileWorkers.length]!;
+                        mobileIdx++;
+                    } else if (desktopWorkers.length > 0) {
+                        worker = desktopWorkers[desktopIdx % desktopWorkers.length]!;
+                        desktopIdx++;
+                    } else {
+                        // Fallback if desktop is missing
+                        worker = mobileWorkers[mobileIdx % mobileWorkers.length]!;
+                        mobileIdx++;
+                    }
+                } else {
+                    // Small chunks: Standard round-robin across all
+                    worker = workers[(desktopIdx + mobileIdx) % workers.length]!;
+                    if ((worker as any).isMobile) mobileIdx++;
+                    else desktopIdx++;
+                }
+
                 worker.send(JSON.stringify({
                     type: "execute_parquet_chunk",
+                    rowCount: chunkMeta ? chunkMeta.rowCount : 0,
                     ...task
                 }));
             });

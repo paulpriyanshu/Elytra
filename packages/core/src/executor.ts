@@ -6,6 +6,7 @@ let parquetInitialized = false;
 
 let parquetPromise: Promise<any> | null = null;
 let parquetLock: Promise<void> = Promise.resolve();
+const parquetFileCache = new Map<string, any>(); // URL -> ParquetFile instance
 
 async function initParquet() {
     if (typeof window === "undefined") return; // Skip SSR
@@ -41,15 +42,19 @@ class WorkerPool {
         }
     }
 
-    async acquire(): Promise<Worker> {
-        const idleWorker = this.workers.find(w => !this.busy.has(w));
-        if (idleWorker) {
-            this.busy.add(idleWorker);
-            return idleWorker;
+    async acquire(): Promise<{ worker: Worker, index: number }> {
+        const index = this.workers.findIndex(w => !this.busy.has(w));
+        if (index !== -1) {
+            const worker = this.workers[index]!;
+            this.busy.add(worker);
+            return { worker, index };
         }
 
         return new Promise(resolve => {
-            this.queue.push(resolve);
+            this.queue.push((worker) => {
+                const idx = this.workers.indexOf(worker);
+                resolve({ worker, index: idx });
+            });
         });
     }
 
@@ -82,13 +87,21 @@ function splitIntoRanges(total: number, parts: number) {
 let pool: WorkerPool | null = null;
 function getPool() {
     if (!pool) {
+        // Use all available hardware threads on BOTH desktop and mobile.
+        // Mobile memory safety is handled by the worker's internal 100k-row batching.
         const threads = typeof navigator !== "undefined" ? Math.max(2, navigator.hardwareConcurrency || 4) : 4;
-        pool = new WorkerPool(threads);
+        const isMobile = typeof navigator !== "undefined" && /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+
+        // Cap mobile threads to avoid OOM crashes (strictly 2 for stability)
+        const finalThreads = isMobile ? Math.min(threads, 2) : threads;
+
+        console.log(`[Executor] ${isMobile ? "Mobile" : "Desktop"} — pool size: ${finalThreads} threads (cap: ${isMobile ? 2 : "none"})`);
+        pool = new WorkerPool(finalThreads);
     }
     return pool;
 }
 
-function runWorker(worker: Worker, payload: any, onProgress?: (msg: any) => void) {
+function runWorker(worker: Worker, payload: any, onProgress?: (msg: any) => void, transfer?: Transferable[]) {
     return new Promise((resolve, reject) => {
         const handler = (e: MessageEvent) => {
             if (!e.data.ok) {
@@ -106,7 +119,7 @@ function runWorker(worker: Worker, payload: any, onProgress?: (msg: any) => void
             }
         };
         worker.addEventListener("message", handler);
-        worker.postMessage(payload);
+        worker.postMessage(payload, transfer || []);
     });
 }
 
@@ -127,47 +140,71 @@ export async function executeParquetPipeline(
     parquetUrl: string,
     rowGroupId: number,
     ops: Op[],
-    onProgress?: (threadId: number, status: string, detail?: any) => void
+    onProgress?: (threadId: number, status: string, detail?: any) => void,
+    rowCount?: number
 ) {
     const p = await initParquet();
     if (!p) throw new Error("Parquet engine not available");
 
-    // Acquire lock to prevent concurrent WASM access issues (FnOnce error)
+    // Global lock: prevents concurrent WASM access issues (FnOnce/null pointer errors)
+    // The WASM engine is strictly single-threaded for many operations.
     const currentLock = parquetLock;
-    let releaseLock: () => void;
+    let releaseLock!: () => void;
     parquetLock = new Promise((resolve) => { releaseLock = resolve; });
     await currentLock;
-    let file: any = null;
+
+    let buffer: ArrayBuffer;
     try {
-        console.log(`[Parquet] Fetching row group ${rowGroupId} from ${parquetUrl.split("/").pop()}...`);
-        file = await p.ParquetFile.fromUrl(parquetUrl);
+        let file = parquetFileCache.get(parquetUrl);
+        const fileName = parquetUrl.split("/").pop() || "unknown";
+
+        if (!file) {
+            console.log(`[Parquet] Fetching ${fileName} for row group ${rowGroupId}...`);
+            file = await p.ParquetFile.fromUrl(parquetUrl);
+
+            // Cache eviction: keep only latest 2 files
+            if (parquetFileCache.size >= 2) {
+                const oldestUrl = parquetFileCache.keys().next().value as string | undefined;
+                if (oldestUrl) {
+                    const oldestFile = parquetFileCache.get(oldestUrl);
+                    if (oldestFile?.free) oldestFile.free();
+                    parquetFileCache.delete(oldestUrl);
+                    console.log(`[Parquet] Evicted ${oldestUrl.split("/").pop() || "unknown"} from cache`);
+                }
+            }
+            parquetFileCache.set(parquetUrl, file);
+        } else {
+            console.log(`[Parquet] Cache hit: row group ${rowGroupId} from ${fileName}`);
+        }
+
         const table = await file.read({ rowGroups: [rowGroupId] });
+        const ipcView = table.intoIPCStream();
+        // Slice copies data from WASM memory into JS memory
+        buffer = ipcView.buffer.slice(ipcView.byteOffset, ipcView.byteOffset + ipcView.byteLength);
 
-        // Slice IPC stream to create a copy in JS memory
-        // NB: table.intoIPCStream() CONSUMES the table, so we don't call table.free()
-        const ipc = table.intoIPCStream().slice();
-
-        // Instead of parsing on main thread, we pass IPC buffer to workers
-        return executePipeline(ipc.buffer, ops, onProgress, true);
+        // table.free() removed as it was causing "null pointer passed to rust" errors
     } catch (err: any) {
-        console.error(`[Parquet] Error in group ${rowGroupId}:`, err);
+        console.error(`[Parquet] Error in row group ${rowGroupId}:`, err);
+        parquetFileCache.delete(parquetUrl);
         throw err;
     } finally {
-        if (file) {
-            try { file.free(); } catch (e) { console.warn("Error freeing ParquetFile:", e); }
-        }
-        releaseLock!();
+        // ALWAYS release the lock so the next row group can start its WASM work
+        releaseLock();
     }
+
+    // executePipeline runs the ACTUAL computation across the worker pool
+    return executePipeline(buffer, ops, onProgress, true, rowCount);
 }
 
-const MIN_ITEMS_PER_THREAD = 20_000;
+const MIN_ITEMS_PER_THREAD = 500_000;
 const MAX_THREADS_CAP = 12;
 
 export async function executePipeline(
     data: any[] | string | ArrayBuffer,
     ops: Op[],
     onProgress?: (threadId: number, status: string, detail?: any) => void,
-    isIpc: boolean = false
+    isIpc: boolean = false,
+    rowCount?: number
 ) {
     let dataset: any[] = [];
     let ipcBuffer: ArrayBuffer | null = null;
@@ -175,9 +212,13 @@ export async function executePipeline(
 
     if (isIpc && data instanceof ArrayBuffer) {
         ipcBuffer = data;
-        // Fast peek to get length
-        const table = tableFromIPC(new Uint8Array(ipcBuffer));
-        totalItems = table.numRows;
+        if (rowCount !== undefined) {
+            totalItems = rowCount;
+        } else {
+            // Fast peek to get length if not provided
+            const table = tableFromIPC(new Uint8Array(ipcBuffer));
+            totalItems = table.numRows;
+        }
     } else if (typeof data === "string") {
         dataset = data.split("\n")
             .filter(line => line.trim().length > 0)
@@ -196,28 +237,94 @@ export async function executePipeline(
     const workerPool = getPool();
     const maxPoolSize = workerPool.getPoolSize();
 
-    // Dynamically calculate threads based on dataset size
+    // Architecture: parallelism lives at the ROW GROUP level — the server sends
+    // each row group to a different browser WebSocket connection (worker page).
+    // Within one row group, always 1 thread handles the whole buffer.
+    // The worker self-batches internally at BATCH_SIZE=100k rows, keeping memory
+    // pressure low on mobile without the cost of duplicating the IPC buffer N times.
+    const isMobile = typeof navigator !== "undefined" && /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+    const batchSize = isMobile ? 50000 : 100000;
+
+    if (isIpc && ipcBuffer) {
+        const deviceLabel = isMobile ? "Mobile" : "Desktop";
+        const SPLIT_THRESHOLD = 500_000;
+
+        if (isMobile && totalItems > SPLIT_THRESHOLD) {
+            // ─── Mobile Split Path ───────────────────────────────────────────
+            console.log(`[Executor] ${deviceLabel} splitting ${totalItems} rows into smaller chunks...`);
+            const table = tableFromIPC(new Uint8Array(ipcBuffer));
+            const parts = Math.ceil(totalItems / SPLIT_THRESHOLD);
+            const ranges = splitIntoRanges(totalItems, parts);
+
+            const partials = await Promise.all(
+                ranges.map(async (range: { start: number; end: number }, i: number) => {
+                    const { worker, index: threadId } = await workerPool.acquire();
+                    try {
+                        if (onProgress) onProgress(threadId, "started", { start: range.start, end: range.end });
+
+                        // Slice and re-serialize to IPC for worker transfer
+                        const slice = table.slice(range.start, range.end);
+
+                        // Correct Way to serialize Table to IPC buffer:
+                        const { RecordBatchStreamWriter } = await import("apache-arrow");
+                        const sliceBuffer = (await RecordBatchStreamWriter.writeAll(slice).toUint8Array()).buffer;
+
+                        const res = await runWorker(
+                            worker,
+                            { id: threadId, data: sliceBuffer, ops, range: { start: 0, end: slice.numRows }, isIpc, batchSize },
+                            (msg) => { if (onProgress) onProgress(threadId, "progress", msg); },
+                            [sliceBuffer]
+                        );
+                        if (onProgress) onProgress(threadId, "done");
+                        return res;
+                    } finally {
+                        workerPool.release(worker);
+                    }
+                })
+            );
+            return mergeResults(partials, ops);
+        } else {
+            // ─── Desktop / Small Mobile Path (No splitting) ──────────────────
+            const { worker, index: threadId } = await workerPool.acquire();
+            console.log(`[Executor] ${deviceLabel} IPC: ${totalItems} rows → Thread ${threadId} (batchSize: ${batchSize})`);
+
+            try {
+                if (onProgress) onProgress(threadId, "started", { start: 0, end: totalItems });
+                const res = await runWorker(
+                    worker,
+                    { id: threadId, data: ipcBuffer, ops, range: { start: 0, end: totalItems }, isIpc, batchSize },
+                    (msg) => { if (onProgress) onProgress(threadId, "progress", msg); },
+                    [ipcBuffer]
+                );
+                if (onProgress) onProgress(threadId, "done");
+                return mergeResults([res], ops);
+            } finally {
+                workerPool.release(worker);
+            }
+        }
+    }
+
+    // ─── Non-IPC path (raw arrays / CSV strings) ─────────────────────────────
     const idealThreads = Math.max(1, Math.floor(totalItems / MIN_ITEMS_PER_THREAD));
     const threads = Math.min(idealThreads, maxPoolSize, MAX_THREADS_CAP);
 
-    console.log(`[Executor] totalItems: ${totalItems}, using ${threads} threads (max: ${maxPoolSize}, isIpc: ${isIpc})`);
+    console.log(`[Executor] Array/CSV: ${totalItems} rows → ${threads} threads (max: ${maxPoolSize})`);
 
     const ranges = splitIntoRanges(totalItems, threads);
 
     const partials = await Promise.all(
         ranges.map(async (range: { start: number; end: number }, i: number) => {
-            const worker = await workerPool.acquire();
+            const { worker, index: threadId } = await workerPool.acquire();
             try {
-                if (onProgress) onProgress(i, "started", { start: range.start, end: range.end });
-
-                const workerData = ipcBuffer ? ipcBuffer : dataset.slice(range.start, range.end);
-
+                if (onProgress) onProgress(threadId, "started", { start: range.start, end: range.end });
+                const workerData = dataset.slice(range.start, range.end);
                 const res = await runWorker(
                     worker,
-                    { id: i, data: workerData, ops, range, isIpc },
-                    (msg) => { if (onProgress) onProgress(i, "progress", msg); }
+                    { id: threadId, data: workerData, ops, range, isIpc: false, batchSize },
+                    (msg) => { if (onProgress) onProgress(threadId, "progress", msg); },
+                    []
                 );
-                if (onProgress) onProgress(i, "done");
+                if (onProgress) onProgress(threadId, "done");
                 return res;
             } finally {
                 workerPool.release(worker);
