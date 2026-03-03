@@ -5,7 +5,10 @@ export type Op =
     | { type: "map"; fn: string }
     | { type: "filter"; fn: string }
     | { type: "count" }
-    | { type: "reduce"; fn: string; initialValue: any };
+    | { type: "reduce"; fn: string; initialValue: any }
+    | { type: "variance"; column: number | string }
+    | { type: "map_fast" }
+    | { type: "sum_fast" };
 
 export class Dataset<T> {
     constructor(
@@ -49,16 +52,44 @@ export class Dataset<T> {
         ], this.datasetId);
     }
 
+    variance(column: number | string): Dataset<any> {
+        return new Dataset<any>(this.data as any, [
+            ...this.ops,
+            { type: "variance", column },
+        ], this.datasetId);
+    }
+
+    /**
+     * Uses SIMD-optimized Rust code from lib.rs directly (map_chunk)
+     */
+    mapFast(): Dataset<T> {
+        return new Dataset<T>(this.data, [
+            ...this.ops,
+            { type: "map_fast" }
+        ], this.datasetId);
+    }
+
+    /**
+     * Uses SIMD-optimized Rust code from lib.rs directly (reduce_sum)
+     */
+    sumFast(): Dataset<T> {
+        return new Dataset<T>(this.data, [
+            ...this.ops,
+            { type: "sum_fast" }
+        ], this.datasetId);
+    }
+
     async collect() {
         return executePipeline(this.data, this.ops);
     }
 
-    async distribute(apiKey: string = "playground-key") {
+    async distribute(apiKey: string = "playground-key", wasmBase64?: string) {
         const { result } = await Elytra.run({
             apiKey,
             data: this.data,
             datasetId: this.datasetId,
-            pipeline: () => this
+            pipeline: () => this,
+            wasmBase64
         });
         return result;
     }
@@ -145,7 +176,8 @@ export class Elytra {
         apiKey: string,
         data?: any[],
         datasetId?: string,
-        pipeline: (d: Dataset<any>) => Dataset<T>
+        pipeline: (d: Dataset<any>) => Dataset<T>,
+        wasmBase64?: string
     }) {
         const initialDataset = new Dataset<any>([]);
         const finalDataset = config.pipeline(initialDataset);
@@ -160,7 +192,8 @@ export class Elytra {
                 apiKey: config.apiKey,
                 data: config.data,
                 datasetId: config.datasetId,
-                ops: ops
+                ops: ops,
+                ...(config.wasmBase64 ? { wasmBase64: config.wasmBase64 } : {})
             })
         });
 

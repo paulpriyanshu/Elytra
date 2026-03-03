@@ -131,17 +131,20 @@ function mergeResults(partials: any[], ops: Op[]): any {
         } else if (lastOp.type === "reduce") {
             const fn = new Function("return " + lastOp.fn)();
             return partials.reduce(fn, lastOp.initialValue);
+        } else if (lastOp.type === "variance") {
+            return partials.reduce((acc, val) => ({
+                sum: acc.sum + val.sum,
+                sumSq: acc.sumSq + val.sumSq,
+                count: acc.count + val.count
+            }), { sum: 0, sumSq: 0, count: 0 });
         }
     }
     return partials.flat();
 }
 
-export async function executeParquetPipeline(
+export async function prepareParquetChunk(
     parquetUrl: string,
     rowGroupId: number,
-    ops: Op[],
-    onProgress?: (threadId: number, status: string, detail?: any) => void,
-    rowCount?: number
 ) {
     const p = await initParquet();
     if (!p) throw new Error("Parquet engine not available");
@@ -154,6 +157,7 @@ export async function executeParquetPipeline(
     await currentLock;
 
     let buffer: ArrayBuffer;
+    let rowCount: number;
     try {
         let file = parquetFileCache.get(parquetUrl);
         const fileName = parquetUrl.split("/").pop() || "unknown";
@@ -178,6 +182,7 @@ export async function executeParquetPipeline(
         }
 
         const table = await file.read({ rowGroups: [rowGroupId] });
+        rowCount = table.numRows;
         const ipcView = table.intoIPCStream();
         // Slice copies data from WASM memory into JS memory
         buffer = ipcView.buffer.slice(ipcView.byteOffset, ipcView.byteOffset + ipcView.byteLength);
@@ -192,8 +197,21 @@ export async function executeParquetPipeline(
         releaseLock();
     }
 
+    return { buffer, rowCount };
+}
+
+export async function executeParquetPipeline(
+    parquetUrl: string,
+    rowGroupId: number,
+    ops: Op[],
+    onProgress?: (threadId: number, status: string, detail?: any) => void,
+    rowCount?: number,
+    wasmBase64?: string
+) {
+    const { buffer, rowCount: detectedRowCount } = await prepareParquetChunk(parquetUrl, rowGroupId);
+
     // executePipeline runs the ACTUAL computation across the worker pool
-    return executePipeline(buffer, ops, onProgress, true, rowCount);
+    return executePipeline(buffer, ops, onProgress, true, rowCount ?? detectedRowCount, wasmBase64);
 }
 
 const MIN_ITEMS_PER_THREAD = 500_000;
@@ -204,7 +222,8 @@ export async function executePipeline(
     ops: Op[],
     onProgress?: (threadId: number, status: string, detail?: any) => void,
     isIpc: boolean = false,
-    rowCount?: number
+    rowCount?: number,
+    wasmBase64?: string
 ) {
     let dataset: any[] = [];
     let ipcBuffer: ArrayBuffer | null = null;
@@ -243,70 +262,33 @@ export async function executePipeline(
     // The worker self-batches internally at BATCH_SIZE=100k rows, keeping memory
     // pressure low on mobile without the cost of duplicating the IPC buffer N times.
     const isMobile = typeof navigator !== "undefined" && /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
-    const batchSize = isMobile ? 50000 : 100000;
+    const batchSize = isMobile ? 50000 : 500000;
 
     if (isIpc && ipcBuffer) {
         const deviceLabel = isMobile ? "Mobile" : "Desktop";
-        const SPLIT_THRESHOLD = 500_000;
 
-        if (isMobile && totalItems > SPLIT_THRESHOLD) {
-            // ─── Mobile Split Path ───────────────────────────────────────────
-            console.log(`[Executor] ${deviceLabel} splitting ${totalItems} rows into smaller chunks...`);
-            const table = tableFromIPC(new Uint8Array(ipcBuffer));
-            const parts = Math.ceil(totalItems / SPLIT_THRESHOLD);
-            const ranges = splitIntoRanges(totalItems, parts);
+        // ─── Direct Path (No splitting) ──────────────────
+        const { worker, index: threadId } = await workerPool.acquire();
+        console.log(`[Executor] ${deviceLabel} IPC: ${totalItems} rows → Thread ${threadId} (batchSize: ${batchSize})`);
 
-            const partials = await Promise.all(
-                ranges.map(async (range: { start: number; end: number }, i: number) => {
-                    const { worker, index: threadId } = await workerPool.acquire();
-                    try {
-                        if (onProgress) onProgress(threadId, "started", { start: range.start, end: range.end });
-
-                        // Slice and re-serialize to IPC for worker transfer
-                        const slice = table.slice(range.start, range.end);
-
-                        // Correct Way to serialize Table to IPC buffer:
-                        const { RecordBatchStreamWriter } = await import("apache-arrow");
-                        const sliceBuffer = (await RecordBatchStreamWriter.writeAll(slice).toUint8Array()).buffer;
-
-                        const res = await runWorker(
-                            worker,
-                            { id: threadId, data: sliceBuffer, ops, range: { start: 0, end: slice.numRows }, isIpc, batchSize },
-                            (msg) => { if (onProgress) onProgress(threadId, "progress", msg); },
-                            [sliceBuffer]
-                        );
-                        if (onProgress) onProgress(threadId, "done");
-                        return res;
-                    } finally {
-                        workerPool.release(worker);
-                    }
-                })
+        try {
+            if (onProgress) onProgress(threadId, "started", { start: 0, end: totalItems });
+            const res = await runWorker(
+                worker,
+                { id: threadId, data: ipcBuffer, ops, range: { start: 0, end: totalItems }, isIpc, batchSize, wasmBase64 },
+                (msg) => { if (onProgress) onProgress!(threadId, "progress", msg); },
+                [ipcBuffer]
             );
-            return mergeResults(partials, ops);
-        } else {
-            // ─── Desktop / Small Mobile Path (No splitting) ──────────────────
-            const { worker, index: threadId } = await workerPool.acquire();
-            console.log(`[Executor] ${deviceLabel} IPC: ${totalItems} rows → Thread ${threadId} (batchSize: ${batchSize})`);
-
-            try {
-                if (onProgress) onProgress(threadId, "started", { start: 0, end: totalItems });
-                const res = await runWorker(
-                    worker,
-                    { id: threadId, data: ipcBuffer, ops, range: { start: 0, end: totalItems }, isIpc, batchSize },
-                    (msg) => { if (onProgress) onProgress(threadId, "progress", msg); },
-                    [ipcBuffer]
-                );
-                if (onProgress) onProgress(threadId, "done");
-                return mergeResults([res], ops);
-            } finally {
-                workerPool.release(worker);
-            }
+            if (onProgress) onProgress(threadId, "done");
+            return mergeResults([res], ops);
+        } finally {
+            workerPool.release(worker);
         }
     }
 
     // ─── Non-IPC path (raw arrays / CSV strings) ─────────────────────────────
     const idealThreads = Math.max(1, Math.floor(totalItems / MIN_ITEMS_PER_THREAD));
-    const threads = Math.min(idealThreads, maxPoolSize, MAX_THREADS_CAP);
+    const threads = isMobile ? Math.min(idealThreads, maxPoolSize, MAX_THREADS_CAP) : 1;
 
     console.log(`[Executor] Array/CSV: ${totalItems} rows → ${threads} threads (max: ${maxPoolSize})`);
 

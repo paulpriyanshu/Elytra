@@ -74,3 +74,9 @@ yarn.lock
 # Elytra Data
 apps/server/datasets/
 apps/server/tmp_uploads/
+
+# Python / Rust Caches
+__pycache__/
+.cargo_cache/
+.venv/
+.env

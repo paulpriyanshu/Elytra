@@ -1,15 +1,16 @@
 {
-    "name": "rust-core",
-    "version": "0.0.0",
-    "private": true,
-    "exports": {
-        ".": {
-            "import": "./pkg/rust_core.js",
-            "types": "./pkg/rust_core.d.ts"
-        }
-    },
-    "scripts": {
-        "build": "wasm-pack build --target web --no-opt",
-        "dev": "wasm-pack build --target web --dev --no-opt"
+  "name": "elytra-wasm",
+  "version": "0.0.0",
+  "private": true,
+  "exports": {
+    ".": {
+      "import": "./pkg/elytra_wasm.js",
+      "types": "./pkg/elytra_wasm.d.ts"
     }
+  },
+  "scripts": {
+    "build": "RUSTFLAGS='-C target-feature=+simd128' wasm-pack build --target web --release",
+    "dev": "RUSTFLAGS='-C target-feature=+simd128' wasm-pack build --target web --dev",
+    "build:profiling": "RUSTFLAGS='-C target-feature=+simd128' wasm-pack build --target web"
+  }
 }

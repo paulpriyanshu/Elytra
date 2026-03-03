@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect } from "react";
-import { Elytra, executePipeline, executeParquetPipeline } from "@elytra/runtime";
+import { Elytra, executePipeline, executeParquetPipeline, prepareParquetChunk } from "@elytra/runtime";
 import styles from "./page.module.css";
 
 export default function Page() {
@@ -14,6 +14,9 @@ export default function Page() {
   const [currentJob, setCurrentJob] = useState<any>(null);
   const [chunkProgress, setChunkProgress] = useState(0);
   const [mounted, setMounted] = useState(false);
+
+  // 📊 Queue Monitoring
+  const [qSizes, setQSizes] = useState({ jobs: 0, decode: 0, results: 0, active: 0, backlog: 0 });
 
   const [lastLogTime, setLastLogTime] = useState(0);
 
@@ -49,42 +52,95 @@ export default function Page() {
       addLog(`Connected to Control Plane (${backendUrl})`);
     };
 
-    const jobQueue: any[] = [];
-    let isProcessing = false;
+    const jobQueue: any[] = [];    // Pending jobs from server
+    const decodeQueue: any[] = []; // Decoded buffers ready for compute
+    const resultQueue: any[] = []; // Computed results ready for upload
 
-    // Desktop: fill all available hardware threads (each row group = 1 thread slot)
-    // Mobile: allow 2–4 concurrent jobs — each job is already batched at ~150k rows
-    //         in executor.ts, so memory per job is bounded even with multiple in-flight.
     const hwThreads = navigator.hardwareConcurrency || 4;
     const MAX_CONCURRENT_TASKS = isMobile ? Math.min(hwThreads, 4) : hwThreads;
-    let activeTasksCount = 0;
+    const MAX_DECODE_QUEUE = isMobile ? 1 : 8; // Increased for desktop to fill 12+ thread pools
+
+    let activeComputeCount = 0;
+    let isDecoding = false;
+    let isUploading = false;
+    let serverBacklog = 0;
+
+    const updateQSizes = () => {
+      setQSizes({
+        jobs: jobQueue.length,
+        decode: decodeQueue.length,
+        results: resultQueue.length,
+        active: activeComputeCount,
+        backlog: serverBacklog
+      });
+    };
 
     if (isMobile) {
-      addLog(`Node running mobile-optimized mode (${MAX_CONCURRENT_TASKS} concurrent jobs, batched at ~150k rows)`);
+      addLog(`Node running mobile-optimized mode (${MAX_CONCURRENT_TASKS} concurrent compute jobs)`);
     } else {
-      addLog(`Node ready: ${MAX_CONCURRENT_TASKS} concurrent jobs (${hwThreads} hardware threads)`);
+      addLog(`Node ready: ${MAX_CONCURRENT_TASKS} concurrent compute jobs (${hwThreads} hardware threads)`);
     }
 
-    const processQueue = async () => {
-      if (jobQueue.length === 0 && activeTasksCount === 0) {
-        setCurrentJob(null);
-        setChunkProgress(0);
-        return;
+    // ─────────────────────────────────────────────────────────────────────────
+    // STAGE A: Decode (Producer 1)
+    // ─────────────────────────────────────────────────────────────────────────
+    const processDecodeQueue = async () => {
+      if (isDecoding || jobQueue.length === 0 || decodeQueue.length >= MAX_DECODE_QUEUE) return;
+
+      isDecoding = true;
+      const { message, ws } = jobQueue.shift();
+      updateQSizes();
+
+      try {
+        if (message.type === "execute_parquet_chunk") {
+          addLog(`[Stage A] Decoding chunk ${message.chunkId}...`);
+          const { buffer, rowCount } = await prepareParquetChunk(message.parquetUrl, message.rowGroupId);
+          decodeQueue.push({ ...message, buffer, rowCount: message.rowCount || rowCount, ws });
+          addLog(`[Stage A] Decoded chunk ${message.chunkId}. Queue size: ${decodeQueue.length}`);
+          updateQSizes();
+        } else {
+          decodeQueue.push({ ...message, ws });
+        }
+
+        // Trigger next stages
+        processComputeQueue();
+
+        // Check if we can decode more (up to MAX_DECODE_QUEUE)
+        isDecoding = false;
+        processDecodeQueue();
+      } catch (error) {
+        addLog(`[Stage A] Error decoding chunk ${message.chunkId}: ${error}`);
+        ws.send(JSON.stringify({
+          type: "chunk_error",
+          jobId: message.jobId,
+          chunkId: message.chunkId,
+          error: (error as Error).message
+        }));
+        isDecoding = false;
+        processDecodeQueue();
       }
+    };
 
-      while (activeTasksCount < MAX_CONCURRENT_TASKS && jobQueue.length > 0) {
-        activeTasksCount++;
-        const { message, ws } = jobQueue.shift();
-        setCurrentJob(message);
+    // ─────────────────────────────────────────────────────────────────────────
+    // STAGE B: Compute (Producer 2 / Consumer 1)
+    // ─────────────────────────────────────────────────────────────────────────
+    const processComputeQueue = async () => {
+      if (decodeQueue.length === 0 || activeComputeCount >= MAX_CONCURRENT_TASKS) return;
 
-        // Process in an IIFE to allow the loop to continue and start other tasks
+      while (activeComputeCount < MAX_CONCURRENT_TASKS && decodeQueue.length > 0) {
+        activeComputeCount++;
+        const message = decodeQueue.shift();
+        updateQSizes();
+
+        // After shifting from decodeQueue, Stage A can potentially fill it again
+        processDecodeQueue();
+
         (async () => {
-          addLog(`Processing job ${message.jobId} (Chunk ${message.chunkId})...`);
+          addLog(`[Stage B] Computing chunk ${message.chunkId}... (Active: ${activeComputeCount}/${MAX_CONCURRENT_TASKS})`);
           try {
             const progressCb = (threadId: number, status: string, detail?: any) => {
               setThreads(prev => {
                 const next = [...prev];
-                // Include chunkId to show which task is on which thread
                 next[threadId] = { status, chunkId: message.chunkId, ...detail };
                 return next;
               });
@@ -109,19 +165,16 @@ export default function Page() {
               }));
             };
 
-            const result = message.type === "execute_parquet_chunk"
-              ? await executeParquetPipeline(message.parquetUrl, message.rowGroupId, message.ops, progressCb, message.rowCount)
-              : await executePipeline(message.data, message.ops, progressCb);
+            const result = message.buffer
+              ? await executePipeline(message.buffer, message.ops, progressCb, true, message.rowCount, message.wasmBase64)
+              : await executePipeline(message.data, message.ops, progressCb, false, undefined, message.wasmBase64);
 
-            addLog(`Completed chunk ${message.chunkId}`);
-            ws.send(JSON.stringify({
-              type: "chunk_result",
-              jobId: message.jobId,
-              chunkId: message.chunkId,
-              result
-            }));
+            addLog(`[Stage B] Completed compute: chunk ${message.chunkId}`);
+            resultQueue.push({ jobId: message.jobId, chunkId: message.chunkId, result, ws: message.ws });
+            updateQSizes();
+            processUploadQueue();
           } catch (error) {
-            addLog(`Error in chunk ${message.chunkId}: ${error}`);
+            addLog(`[Stage B] Error in chunk ${message.chunkId}: ${error}`);
             ws.send(JSON.stringify({
               type: "chunk_error",
               jobId: message.jobId,
@@ -129,11 +182,33 @@ export default function Page() {
               error: (error as Error).message
             }));
           } finally {
-            activeTasksCount--;
-            processQueue(); // Try to pick up next job
+            activeComputeCount--;
+            updateQSizes();
+            processComputeQueue(); // Try to pick up next compute job
           }
         })();
       }
+    };
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // STAGE C: Upload (Consumer 2)
+    // ─────────────────────────────────────────────────────────────────────────
+    const processUploadQueue = async () => {
+      if (isUploading || resultQueue.length === 0) return;
+
+      isUploading = true;
+      while (resultQueue.length > 0) {
+        const { jobId, chunkId, result, ws } = resultQueue.shift();
+        updateQSizes();
+        addLog(`[Stage C] Uploading chunk ${chunkId}...`);
+        ws.send(JSON.stringify({
+          type: "chunk_result",
+          jobId,
+          chunkId,
+          result
+        }));
+      }
+      isUploading = false;
     };
 
     ws.onmessage = async (event) => {
@@ -141,8 +216,10 @@ export default function Page() {
 
       if (message.type === "execute_chunk" || message.type === "execute_parquet_chunk") {
         addLog(`Enqueued job ${message.jobId} (Chunk ${message.chunkId})`);
+        serverBacklog = message.remainingTasks || 0;
         jobQueue.push({ message, ws });
-        processQueue();
+        updateQSizes();
+        processDecodeQueue();
       }
     };
 
@@ -182,6 +259,13 @@ export default function Page() {
         <div className={styles.titleSection}>
           <h1>Worker Node</h1>
           <p>Processing distributed tasks in real-time</p>
+          <div className={styles.queueStatus}>
+            <span title="Pending Local Decode">📥 Jobs: {qSizes.jobs}</span>
+            <span title="Ready for Compute">⚙️ Buffer: {qSizes.decode}</span>
+            <span title="Currently Computing">🔥 Active: {qSizes.active}</span>
+            <span title="Global Server Backlog">☁️ Ready: {qSizes.backlog}</span>
+            <span title="Pending Upload">📤 Results: {qSizes.results}</span>
+          </div>
         </div>
         <div className={`${styles.statusBadge} ${currentJob ? styles.statusBadgeActive : ""}`}>
           {currentJob ? "Active Processing" : "Waiting for Jobs"}
@@ -279,6 +363,6 @@ export default function Page() {
       <footer className={styles.footer}>
         &copy; 2026 Elytra Worker Node • Part of Distributed Mesh
       </footer>
-    </div>
+    </div >
   );
 }

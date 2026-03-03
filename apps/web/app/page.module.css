@@ -29,6 +29,27 @@
 .titleSection p {
   color: #71717a;
   font-size: 1.1rem;
+  margin-bottom: 24px;
+}
+
+.queueStatus {
+  display: flex;
+  gap: 20px;
+  background: rgba(255, 255, 255, 0.03);
+  padding: 12px 24px;
+  border-radius: 16px;
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  width: fit-content;
+}
+
+.queueStatus span {
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: #a1a1aa;
+  cursor: help;
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .statusBadge {

@@ -25,6 +25,7 @@ return result;`);
     const [uploadProgress, setUploadProgress] = useState(0);
     const [taskProgress, setTaskProgress] = useState(0);
     const [mounted, setMounted] = useState(false);
+    const [workers, setWorkers] = useState<Map<string, { id: string, taskCount: number, lastStatus: string }>>(new Map());
 
     // Track worker progress for overall task percentage
     const workerProgressMap = useRef<Map<string, number>>(new Map());
@@ -176,6 +177,18 @@ return result;`;
                     workerProgressMap.current.set(message.chunkId, message.progress);
                 }
 
+                // Update worker metrics
+                setWorkers(prev => {
+                    const next = new Map(prev);
+                    const worker = next.get(message.workerId) || { id: message.workerId, taskCount: 0, lastStatus: "idle" };
+                    next.set(message.workerId, {
+                        ...worker,
+                        taskCount: message.taskCount || worker.taskCount,
+                        lastStatus: message.status
+                    });
+                    return next;
+                });
+
                 // Update aggregate task progress
                 const chunkValues = Array.from(workerProgressMap.current.values());
                 if (chunkValues.length > 0) {
@@ -184,10 +197,60 @@ return result;`;
                 }
                 return;
             }
+
+            if (message.type === "worker_update") {
+                setWorkers(prev => {
+                    const next = new Map(prev);
+                    const worker = next.get(message.workerId) || { id: message.workerId, taskCount: 0, lastStatus: "idle" };
+                    next.set(message.workerId, {
+                        ...worker,
+                        taskCount: message.taskCount,
+                        lastStatus: message.status
+                    });
+                    return next;
+                });
+                return;
+            }
         };
 
         return () => ws.close();
     }, [isLocal, backendUrl]);
+
+    // Python LLM compiler server URL
+    const llmServerUrl = isLocal ? "http://localhost:8000" : "https://elytra-llm.coryfi.com";
+
+    /**
+     * Calls the Python FastAPI server to compile user JS to WASM via LLM.
+     * Returns wasmBase64 string or null if compilation fails/skipped.
+     */
+    async function compileToWasm(jsCode: string, ops: any[], parquetUrl?: string): Promise<string | null> {
+        try {
+            addNetworkLog("🦀 Compiling JS → Rust (LLM)...", "info");
+            const res = await fetch(`${llmServerUrl}/compile`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    js_code: jsCode,
+                    ops,
+                    parquet_url: parquetUrl || null,
+                    dataset_id: datasetId || null
+                })
+            });
+
+            if (!res.ok) {
+                const err = await res.json().catch(() => ({}));
+                addNetworkLog(`⚠️ WASM compile failed: ${JSON.stringify(err.detail || err)}. Falling back to JS.`, "info");
+                return null;
+            }
+
+            const data = await res.json();
+            addNetworkLog(`✅ WASM compiled (${Math.round(data.wasm_base64.length * 0.75 / 1024)}KB). Running with Rust kernel.`, "info");
+            return data.wasm_base64;
+        } catch (e: any) {
+            addNetworkLog(`⚠️ LLM server unreachable: ${e.message}. Running in JS mode.`, "info");
+            return null;
+        }
+    }
 
     async function runDistributed() {
         setRunning(true);
@@ -199,12 +262,96 @@ return result;`;
         const start = performance.now();
 
         try {
+            // ── Step 1: Capture ops via a recursive proxy ─────────────────────
+            // The proxy re-wraps every returned Dataset so the FULL chain is
+            // intercepted, preventing double execution via the real distribute().
+
+            let capturedOps: any[] = [];
+            let capturedParquetUrl: string | undefined;
+
+            if (datasetId) {
+                const ds = availableDatasets.find((d: any) => d.id === datasetId);
+                if (ds) {
+                    const R2_PUBLIC_URL = "https://elytra.aradhangini.com";
+                    const s3Key = ds.s3Key || `parquet/${datasetId}.parquet`;
+                    capturedParquetUrl = `${R2_PUBLIC_URL}/${s3Key}`;
+                }
+            }
+
+            // Recursively wrap a Dataset object so every chained call is also wrapped,
+            // and distribute() is intercepted to capture ops instead of firing a real job.
+            function makeDatasetProxy(realDs: any): any {
+                return new Proxy(realDs, {
+                    get(target: any, prop: string) {
+                        if (prop === "distribute") {
+                            return async () => {
+                                capturedOps = target.ops || [];
+                                return null; // stop here — do NOT call real distribute
+                            };
+                        }
+                        const val = target[prop];
+                        if (typeof val === "function") {
+                            return (...args: any[]) => {
+                                const ret = val.apply(target, args);
+                                // If the returned value looks like a Dataset (has .ops), wrap it too
+                                if (ret && typeof ret === "object" && Array.isArray(ret.ops)) {
+                                    return makeDatasetProxy(ret);
+                                }
+                                return ret;
+                            };
+                        }
+                        return val;
+                    }
+                });
+            }
+
+            const ElytraProxy = new Proxy(Elytra as any, {
+                get(target: any, prop: string) {
+                    if (prop === "remote" || prop === "dataset") {
+                        return (...args: any[]) => {
+                            const realDs = (target as any)[prop](...args);
+                            return makeDatasetProxy(realDs);
+                        };
+                    }
+                    const val = (target as any)[prop];
+                    return typeof val === "function" ? val.bind(target) : val;
+                }
+            });
+
+            try {
+                const dryRun = new Function("Elytra", "currentDatasetId", `
+                    return (async () => {
+                        const Dataset = { id: currentDatasetId };
+                        ${code}
+                    })();
+                `);
+                await dryRun(ElytraProxy, datasetId);
+            } catch (_) { /* dry-run may throw for some patterns, that's OK */ }
+
+            // ── Step 2: Compile to WASM via LLM (Python server) ────────────────
+            let wasmBase64: string | null = null;
+            const needsCompilation = capturedOps.some(op =>
+                op.type === "map" ||
+                op.type === "filter" ||
+                op.type === "reduce"
+            );
+
+            if (datasetId && capturedOps.length > 0 && needsCompilation) {
+                wasmBase64 = await compileToWasm(code, capturedOps, capturedParquetUrl);
+            } else if (capturedOps.length > 0 && !needsCompilation) {
+                addNetworkLog("⚡ Skipping LLM: All operations are pre-compiled in lib.rs", "info");
+            }
+
+            // ── Step 3: Run real job once, with wasmBase64 injected ─────────────
+            // Patch .distribute() call to pass the wasmBase64 arg
+            const codeWithWasm = code.replace(
+                /\.distribute\(\)/g,
+                `.distribute("playground-key", ${JSON.stringify(wasmBase64)})`
+            );
             const executor = new Function("Elytra", "currentDatasetId", `
                 return (async () => {
-                    const Dataset = {
-                      id: currentDatasetId
-                    };
-                    ${code.replace(".distribute()", `.distribute("playground-key")`)}
+                    const Dataset = { id: currentDatasetId };
+                    ${codeWithWasm}
                 })();
             `);
 
@@ -408,6 +555,37 @@ return result;`;
                                 <span style={{ color: "#fff", fontWeight: 600 }}>{mounted ? (isLocal ? "Local" : "Cloud") : "---"}</span>
                             </div>
                         </div>
+
+                        {workers.size > 0 && (
+                            <div style={{ marginTop: 24 }}>
+                                <h4 style={{ color: "#fff", fontSize: "0.75rem", marginBottom: 12, textTransform: "uppercase" }}>Connected Workers</h4>
+                                <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                                    {Array.from(workers.values()).map(worker => (
+                                        <div key={worker.id} style={{
+                                            display: "flex",
+                                            justifyContent: "space-between",
+                                            alignItems: "center",
+                                            background: "rgba(255,255,255,0.03)",
+                                            padding: "8px 12px",
+                                            borderRadius: "8px",
+                                            fontSize: "0.75rem"
+                                        }}>
+                                            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                                                <div style={{
+                                                    width: 6,
+                                                    height: 6,
+                                                    borderRadius: "50%",
+                                                    background: worker.lastStatus === "idle" ? "#71717a" : "#10b981"
+                                                }} />
+                                                <span style={{ color: "#e4e4e7" }}>{worker.id}</span>
+                                            </div>
+                                            <span style={{ color: "var(--primary)", fontWeight: 600 }}>{worker.taskCount} tasks</span>
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
+                        )}
+
                         {uploading && (
                             <div style={{ marginTop: 12 }}>
                                 <div style={{ display: "flex", justifyContent: "space-between", fontSize: "0.75rem", color: "var(--secondary)", marginBottom: 6 }}>

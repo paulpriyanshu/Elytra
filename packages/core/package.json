@@ -16,8 +16,8 @@
         "@aws-sdk/lib-storage": "^3.1000.0",
         "@types/node-fetch": "^2.6.13",
         "apache-arrow": "^21.1.0",
-        "parquet-wasm": "^0.7.1",
-        "rust-core": "*"
+        "elytra-wasm": "*",
+        "parquet-wasm": "^0.7.1"
     },
     "devDependencies": {
         "typescript": "^5.0.0"

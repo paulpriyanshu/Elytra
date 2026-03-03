@@ -188,7 +188,8 @@ app.get("/api/datasets", (req, res) => {
         name: meta.name,
         timestamp: meta.timestamp,
         rowGroupCount: meta.rowGroups.length,
-        format: meta.format
+        format: meta.format,
+        s3Key: meta.s3Key
     }));
     res.json(list);
 });
@@ -220,12 +221,17 @@ const jobs = new Map<number, {
     partials: any[];
     expectedChunks: number;
     completedChunks: number;
+    taskQueue: any[];
 }>();
 
 wss.on("connection", (ws, req) => {
     const url = new URL(req.url || "", `http://${req.headers.host}`);
     const role = url.searchParams.get("role") || "worker";
     const remoteIp = req.socket.remoteAddress;
+    const workerId = Math.random().toString(36).slice(2, 6);
+    (ws as any).workerId = workerId;
+    (ws as any).taskCount = 0;
+    (ws as any).inFlight = 0;
 
     (ws as any).isAlive = true;
     ws.on("pong", () => { (ws as any).isAlive = true; });
@@ -247,7 +253,11 @@ wss.on("connection", (ws, req) => {
 
             if (data.type === "worker_progress") {
                 // Broadcast progress to all controllers
-                const progressMsg = JSON.stringify(data);
+                const progressMsg = JSON.stringify({
+                    ...data,
+                    workerId: (ws as any).workerId,
+                    taskCount: (ws as any).taskCount
+                });
                 activeControllers.forEach(controller => {
                     if (controller.readyState === WebSocket.OPEN) {
                         controller.send(progressMsg);
@@ -261,6 +271,38 @@ wss.on("connection", (ws, req) => {
                 if (!job) return;
                 job.partials[data.chunkId] = data.result;
                 job.completedChunks++;
+                (ws as any).inFlight--;
+
+                // Assign next tasks from queue to maintain a buffer of ~6
+                const TARGET_BUFFER = 6;
+                while (job.taskQueue.length > 0 && (ws as any).inFlight < TARGET_BUFFER) {
+                    const nextTask = job.taskQueue.shift();
+                    (ws as any).taskCount++;
+                    (ws as any).inFlight++;
+                    console.log(`[Job ${data.jobId}] Worker ${(ws as any).workerId} refill: chunk ${nextTask.chunkId}. In-flight: ${(ws as any).inFlight}. Queue: ${job.taskQueue.length}`);
+                    ws.send(JSON.stringify({
+                        type: "execute_parquet_chunk",
+                        rowCount: nextTask.rowCount || 0,
+                        remainingTasks: job.taskQueue.length,
+                        ...nextTask
+                    }));
+                }
+
+                // Broadcast completion to controllers
+                const updateMsg = JSON.stringify({
+                    type: "worker_update",
+                    jobId: data.jobId,
+                    workerId: (ws as any).workerId,
+                    taskCount: (ws as any).taskCount,
+                    lastChunkId: data.chunkId,
+                    status: "done"
+                });
+                activeControllers.forEach(controller => {
+                    if (controller.readyState === WebSocket.OPEN) {
+                        controller.send(updateMsg);
+                    }
+                });
+
                 if (job.completedChunks === job.expectedChunks) {
                     const finalResult = mergeResults(job.partials, job.ops);
                     job.resolve(finalResult);
@@ -301,10 +343,17 @@ wss.on("close", () => {
 function mergeResults(partials: any[], ops: any[]): any {
     if (ops.length > 0) {
         const lastOp = ops[ops.length - 1]!;
-        if (lastOp.type === "count") return partials.reduce((acc, val) => acc + val, 0);
-        if (lastOp.type === "reduce") {
+        if (lastOp.type === "count" || lastOp.type === "sum_fast") {
+            return partials.reduce((acc, val) => acc + (Number(val) || 0), 0);
+        } else if (lastOp.type === "reduce") {
             const fn = new Function("return " + lastOp.fn)();
             return partials.reduce(fn, lastOp.initialValue);
+        } else if (lastOp.type === "variance") {
+            return partials.reduce((acc, val) => ({
+                sum: (acc.sum || 0) + (val.sum || 0),
+                sumSq: (acc.sumSq || 0) + (val.sumSq || 0),
+                count: (acc.count || 0) + (val.count || 0)
+            }), { sum: 0, sumSq: 0, count: 0 });
         }
     }
     return partials.flat();
@@ -312,7 +361,7 @@ function mergeResults(partials: any[], ops: any[]): any {
 
 app.post("/api/jobs", async (req, res) => {
     try {
-        const { apiKey, datasetId, ops } = req.body;
+        const { apiKey, datasetId, ops, wasmBase64 } = req.body;
         const dataset = datasets.get(datasetId);
         if (!dataset) return res.status(404).json({ error: "Dataset not found" });
         if (activeWorkers.size === 0) return res.status(503).json({ error: "No workers available" });
@@ -324,59 +373,50 @@ app.post("/api/jobs", async (req, res) => {
             chunkId: idx,
             rowGroupId: rg.id,
             parquetUrl: `${R2_PUBLIC_URL}/${dataset.s3Key}`,
-            ops
+            ops,
+            ...(wasmBase64 ? { wasmBase64 } : {})
         }));
 
         const result = await new Promise((resolve, reject) => {
+            const workers = Array.from(activeWorkers);
+
             jobs.set(jobId, {
                 resolve, reject, ops,
                 partials: new Array(tasks.length),
                 expectedChunks: tasks.length,
-                completedChunks: 0
+                completedChunks: 0,
+                taskQueue: tasks.slice(workers.length) // Remaining tasks
             });
 
-            // Weighted Distribution Strategy: 4:1 Ratio for Large Chunks
-            const workers = Array.from(activeWorkers);
-            const desktopWorkers = workers.filter(w => !(w as any).isMobile);
-            const mobileWorkers = workers.filter(w => (w as any).isMobile);
+            // Initial assignment: Give a batch of tasks to each worker (pre-fill pipeline)
+            const INITIAL_BATCH_SIZE = 6;
+            console.log(`[Job ${jobId}] Starting job with ${tasks.length} tasks and ${workers.length} workers. Batch size: ${INITIAL_BATCH_SIZE}`);
 
-            let desktopIdx = 0;
-            let mobileIdx = 0;
-            let largeChunkCount = 0;
+            let taskIdx = 0;
+            workers.forEach((worker) => {
+                for (let i = 0; i < INITIAL_BATCH_SIZE; i++) {
+                    const task = tasks[taskIdx++];
+                    if (!task) break;
 
-            tasks.forEach((task) => {
-                const chunkMeta = dataset.rowGroups[task.chunkId];
-                const isLargeChunk = chunkMeta && chunkMeta.rowCount > 500_000;
+                    (worker as any).taskCount++;
+                    (worker as any).inFlight = ((worker as any).inFlight || 0) + 1;
 
-                let worker: WebSocket;
-
-                if (isLargeChunk) {
-                    largeChunkCount++;
-                    // Every 4th large chunk (index 3, 7, etc.) goes to mobile IF available
-                    if (largeChunkCount % 4 === 0 && mobileWorkers.length > 0) {
-                        worker = mobileWorkers[mobileIdx % mobileWorkers.length]!;
-                        mobileIdx++;
-                    } else if (desktopWorkers.length > 0) {
-                        worker = desktopWorkers[desktopIdx % desktopWorkers.length]!;
-                        desktopIdx++;
-                    } else {
-                        // Fallback if desktop is missing
-                        worker = mobileWorkers[mobileIdx % mobileWorkers.length]!;
-                        mobileIdx++;
-                    }
-                } else {
-                    // Small chunks: Standard round-robin across all
-                    worker = workers[(desktopIdx + mobileIdx) % workers.length]!;
-                    if ((worker as any).isMobile) mobileIdx++;
-                    else desktopIdx++;
+                    const chunkMeta = dataset.rowGroups[task.chunkId];
+                    worker.send(JSON.stringify({
+                        type: "execute_parquet_chunk",
+                        rowCount: chunkMeta ? chunkMeta.rowCount : 0,
+                        remainingTasks: tasks.length - taskIdx,
+                        ...task
+                    }));
                 }
-
-                worker.send(JSON.stringify({
-                    type: "execute_parquet_chunk",
-                    rowCount: chunkMeta ? chunkMeta.rowCount : 0,
-                    ...task
-                }));
+                console.log(`[Job ${jobId}] Assigned initial batch to ${(worker as any).workerId}: ${(worker as any).inFlight} tasks.`);
             });
+
+            // Update job taskQueue
+            const existingJob = jobs.get(jobId);
+            if (existingJob) {
+                existingJob.taskQueue = tasks.slice(taskIdx);
+            }
         });
 
         res.json({ result });
