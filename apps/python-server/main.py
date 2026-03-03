@@ -116,7 +116,7 @@ async def fetch_parquet_sample(parquet_url: str, max_rows: int = 5) -> tuple[lis
             num_row_groups = pf.num_row_groups
             print(f"[Sample] File has {num_row_groups} row groups")
             if num_row_groups == 0:
-                return [], [], {}
+                return [], [], {} 
 
             table = pf.read_row_group(0)
             print(f"[Sample] Read row group 0 ({table.num_rows} rows)")
