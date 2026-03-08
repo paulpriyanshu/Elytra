@@ -6,91 +6,73 @@
 
 ## 🏗️ Architecture Overview
 
-Elytra is composed of three primary components working in harmony:
+Elytra is composed of five primary components working in harmony:
 
-1.  **SDK (Runtime)**: the client-side library used to define datasets and pipelines. It handles streaming uploads and job submission.
-2.  **Control Plane (Server)**: An Express-based orchestrator that manages persistent datasets, job scheduling, and maintains real-time WebSocket connections with distributed workers.
-3.  **Browser Workers**: Web Workers that perform the actual heavy lifting—either uploading data chunks in parallel or executing computation logic on data fragments.
+1.  **SDK (Runtime)**: the client-side library used to define datasets and pipelines via a fluent API.
+2.  **Control Plane (Node.js)**: An Express-based orchestrator that manages dataset registration (using DuckDB for partitioning), job scheduling, and WebSocket connections.
+3.  **LLM Compiler (Python)**: A dynamic translation engine that converts JavaScript pipeline operations into SIMD-optimized Rust/WASM code on-the-fly.
+4.  **Worker Node (Browser)**: The execution environment that runs in any browser tab, managing a pool of Web Workers to process data chunks.
+5.  **Rust Core**: A set of high-performance base kernels used by the compiler and workers for heavy-duty computations.
 
 ```mermaid
 graph TD
     User([User App / Playground]) -- Fluent API --> SDK[Elytra SDK]
-    SDK -- HTTP/Streaming --> CP[Control Plane Server]
-    CP -- Job Distribution --> W1[Browser Worker 1]
-    CP -- Job Distribution --> W2[Browser Worker 2]
-    CP -- Job Distribution --> Wn[Browser Worker n]
-    W1 -- Results --> CP
-    W2 -- Results --> CP
-    Wn -- Results --> CP
+    SDK -- HTTP/Jobs --> CP[Control Plane Server]
+    CP -- Pipeline + Sample --> LLM[LLM Compiler Python]
+    LLM -- Compiled WASM --> CP
+    CP -- Job + WASM --> W1[Browser Worker 1]
+    CP -- Job + WASM --> W2[Browser Worker 2]
+    CP -- Job + WASM --> Wn[Browser Worker n]
+    W1 & W2 & Wn -- Results --> CP
     CP -- Aggregate Result --> User
 ```
 
 ---
 
-## 📤 Data Upload & Storage
-
-To handle massive files (like 4GB+ CSVs) without crashing the browser or server, Elytra uses a **Streaming Chunked Upload** strategy.
-
-### The Upload Process:
-1.  **Handshake**: The SDK requests an `uploadId` from the Control Plane.
-2.  **Parallel Slicing**: The `StreamUploader` uses `File.slice()` to create 5MB–50MB chunks without loading the whole file into memory.
-3.  **Worker Dispatch**: Chunks are handed off to dedicated **Upload Workers**.
-4.  **Atomic Persistence**: The server receives chunks via Multer, writes them to `tmp_uploads`, and then performs an **atomic rename** to move them into the final `datasets/{uploadId}/shard_n/` directory.
-
-```mermaid
-sequenceDiagram
-    participant B as Browser (SDK)
-    participant W as Upload Workers
-    participant S as Server (Control Plane)
-    participant D as Disk
-
-    B->>S: POST /api/start-upload
-    S-->>B: { uploadId }
-    loop For each chunk
-        B->>W: slice(chunk)
-        W->>S: POST /api/upload-chunk (FormData)
-        S->>D: Save chunk_{id}.csv
-    end
-    S->>D: Update meta.json
-```
-
----
-
-## ⚡ Distributed Execution (`.distribute()`)
+## ⚡ Distributed Execution & Job Distribution
 
 The core power of Elytra lies in its ability to split a massive job into tiny tasks that run in parallel.
 
-### How it works:
-1.  **Pipeline Definition**: Use `Elytra.remote(id).map().filter().count()`.
-2.  **Job Submission**: When `.distribute()` is called, the SDK sends the operation list (serialized as strings) to the Control Plane.
-3.  **Task Splitting**: The Control Plane identifies which shards/chunks belong to the dataset and creates a task list.
-4.  **WebSocket Orchestration**: Tasks are pushed via WebSockets to all connected browser workers.
-5.  **Compute**: Each worker executes the `compute.worker`, which parses its assigned CSV chunk, runs the operations, and sends back a partial result.
-6.  **Aggregation**: The Control Plane merges partial results (e.g., summing counts or concatenating arrays) and returns the final answer to the user.
+### Weighted Distribution Strategy
+To balance performance across heterogeneous devices, Elytra uses a **4:1 weighted ratio** for large chunks (>500k rows):
+*   **Desktop Workers**: Handle the majority of heavy workloads.
+*   **Mobile Workers**: Assigned every 4th large chunk (if available) and prioritize smaller tasks.
 
-```mermaid
-graph LR
-    A[Remote Dataset] --> B{Control Plane}
-    B --> C[Task 1: Chunk A]
-    B --> D[Task 2: Chunk B]
-    B --> E[Task n: Chunk n]
-    C --> F[Worker 1]
-    D --> G[Worker 2]
-    E --> H[Worker 3]
-    F & G & H --> I[Partial Results]
-    I --> J[Aggregation]
-    J --> K[Final Output]
-```
+### The Execution Flow:
+1.  **Partitioning**: The Control Plane uses DuckDB to extract Row Group metadata from Parquet files.
+2.  **Just-In-Time Compilation**: For custom pipelines, the Python server generates SIMD-optimized Rust and compiles it to WASM.
+3.  **WebSocket Orchestration**: Tasks and WASM payloads are pushed to connected browser workers.
+4.  **Aggregation**: The Control Plane merges partial results (summing counts, concatenating arrays, or merging variance partials).
 
 ---
 
-## 🚀 Key Features
+## 🚀 Browser Execution Engine
 
--   **Fluent API**: `dataset().map().filter().reduce().distribute()`
--   **Zero Memory Bloat**: Uses streaming and file slicing for O(1) memory footprint during large uploads.
--   **Atomic Persistence**: Ensures storage efficiency and prevents corruption using atomic file operations.
--   **Auto-Cleanup**: Background tasks automatically prune old datasets to manage disk space.
--   **Browser-Powered**: Turn any browser tab into a compute node in your distributed network.
+Elytra's browser runtime is fine-tuned for high-performance and memory stability.
+
+### Core Technologies:
+*   **Parquet-WASM**: Efficiently reads Parquet row groups directly from R2/S3.
+*   **Apache Arrow (IPC)**: Uses zero-copy transfers between the WASM engine and Web Workers.
+*   **Global Locking**: Coordinates access to the single-threaded WASM engine to prevent memory corruption.
+
+### Platform-Specific Optimizations:
+| Feature | Desktop Worker | Mobile Worker |
+| :--- | :--- | :--- |
+| **Concurrency Cap** | `navigator.hardwareConcurrency` | Capped at `min(4, hwThreads)` |
+| **Internal Worker Pool** | All hardware threads | Capped at **2 threads** for stability |
+| **Memory Pressure** | Higher buffer tolerance | Strict **50k-row batching** to prevent OOM |
+| **Internal Splitting** | Processes row group as unit | Further splits large row groups |
+
+---
+
+## 📤 Data Upload & Storage
+
+To handle massive files (like 4GB+ CSVs), Elytra uses a **Streaming Chunked Upload** strategy.
+
+### The Upload Process:
+1.  **Parallel Slicing**: The SDK uses `File.slice()` to create chunks without loading the whole file into memory.
+2.  **Worker Dispatch**: Chunks are handed off to dedicated **Upload Workers**.
+3.  **Atomic Persistence**: The server receives chunks and performs an **atomic rename** into the final dataset shards.
 
 ---
 
@@ -99,10 +81,14 @@ graph LR
 ```text
 elytra/
 ├── apps/
-│   ├── server/          # Control Plane (Express + WebSocket)
-│   └── playground/      # Next.js UI for testing
-└── packages/
-    └── core/            # Eloytra SDK & Worker logic
+│   ├── server/          # Control Plane (Express + WebSocket + DuckDB)
+│   ├── python-server/   # LLM Compiler (FastAPI + LangChain + wasm-pack)
+│   ├── playground/      # Next.js UI for job orchestration
+│   └── web/             # Browser Worker Page
+├── packages/
+│   ├── core/            # Elytra SDK, Executor & Worker logs
+│   ├── rust-core/       # SIMD-optimized Rust kernels
+│   └── ui/              # Shared UI components
 ```
 
 ---
@@ -110,5 +96,6 @@ elytra/
 ## 🏁 Getting Started
 
 1.  **Install dependencies**: `npm install`
-2.  **Run in Dev mode**: `npm run dev`
-3.  **Open Playground**: Navigate to `http://localhost:3000` to start uploading and processing data!
+2.  **Set Environment Variables**: Ensure `OPENAI_API_KEY` is set for the Python server.
+3.  **Run in Dev mode**: `npm run dev`
+4.  **Open Playground**: Navigate to `http://localhost:3000` to start processing!
