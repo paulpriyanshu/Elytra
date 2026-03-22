@@ -20,7 +20,8 @@ import httpx
 import asyncio
 from pathlib import Path
 from typing import Any, Optional
-
+from dotenv import load_dotenv
+load_dotenv()
 import fsspec
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -33,6 +34,8 @@ from langchain_core.messages import HumanMessage, SystemMessage
 # ─────────────────────────────────────────────────────────────
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+print("hey")
+print(OPENAI_API_KEY)
 if not OPENAI_API_KEY:
     raise ValueError("OPENAI_API_KEY not found in environment")
 
@@ -63,6 +66,7 @@ llm = ChatOpenAI(
     model="gpt-4o-mini",
     temperature=0.0,
     openai_api_key=OPENAI_API_KEY,
+    model_kwargs={"response_format": {"type": "json_object"}}
 )
 
 # ─────────────────────────────────────────────────────────────
@@ -82,6 +86,7 @@ class CompileResponse(BaseModel):
     message: str
     col_names: list[str] = []
     col_types: dict[str, str] = {}
+    used_columns: list[str] = []
 
 
 # ─────────────────────────────────────────────────────────────
@@ -236,6 +241,33 @@ for i in 0..outer.length() {{
 
 ---
 
+## REDUCERS WITH INITIAL VALUES
+If the JS code uses a `reduce((a, b) => ..., {{ ...initialObj }})` pattern:
+1. Define a `#[derive(Serialize, Deserialize, Clone)] struct Accumulator {{ ... }}` that matches the initial object's shape.
+2. Initialize the accumulator using the fields from the JS initial object.
+3. Return the result using `serde_wasm_bindgen::to_value(&acc).unwrap()`.
+
+Example:
+```rust
+#[derive(Serialize, Deserialize, Clone)]
+struct Accumulator {{ count: f64, sum: f64 }}
+
+#[wasm_bindgen]
+pub fn execute_user_pipeline(rows: JsValue) -> JsValue {{
+    let mut acc = Accumulator {{ count: 0.0, sum: 0.0 }};
+    let arr = js_sys::Array::from(&rows);
+    for i in 0..arr.length() {{
+        let row = js_sys::Array::from(&arr.get(i));
+        let val = row.get(0).as_f64().unwrap_or(0.0);
+        acc.count += 1.0;
+        acc.sum += val;
+    }}
+    serde_wasm_bindgen::to_value(&acc).unwrap()
+}}
+```
+
+---
+
 ## Existing Rust Kernels (for reference):
 ```rust
 {lib_rs_context}
@@ -251,9 +283,15 @@ serde_json = "1"
 ```
 
 ## Output Format
-Respond with ONLY valid Rust source code. No markdown fences, no explanations.
-The code MUST start with: `use wasm_bindgen::prelude::*;`
+Respond with ONLY a JSON object containing EXACTLY two keys:
+1. `"rust_source"`: A string containing the valid Rust source code. The code MUST start with `use wasm_bindgen::prelude::*;`. No markdown fences inside the string.
+2. `"used_columns"`: A JSON array of strings containing the exact column names from the Dataset Schema that the user's JS code actually reads or requires.
 
+Example:
+{{
+  "rust_source": "use wasm_bindgen::prelude::*; ...",
+  "used_columns": ["col_name_1", "col_name_2"]
+}}
 """
 
 
@@ -374,10 +412,10 @@ async def generate_and_compile(
     col_names: list,
     col_types: dict,
     lib_rs_context: str,
-) -> tuple[str, bytes]:
+) -> tuple[str, bytes, list[str]]:
     """
     Generate Rust via LLM and compile, with automatic retry on compile failure.
-    Returns (rust_source, wasm_bytes).
+    Returns (rust_source, wasm_bytes, used_columns).
     """
     system_prompt = build_system_prompt(lib_rs_context)
     user_prompt = build_user_prompt(js_code, ops, sample_rows, col_names, col_types)
@@ -389,23 +427,25 @@ async def generate_and_compile(
         print(f"[Compile] LLM attempt {attempt}/{MAX_RETRY_ATTEMPTS}...")
         try:
             response = await asyncio.to_thread(llm.invoke, messages)
-            raw_rust = response.content
+            raw_response = json.loads(response.content)
+            raw_rust = raw_response.get("rust_source", "")
+            used_columns = raw_response.get("used_columns", [])
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"LLM generation failed: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"LLM generation failed or invalid JSON: {str(e)}")
 
         rust_source = extract_rust_code(raw_rust)
-        print(f"[Compile] Generated Rust ({len(rust_source)} chars)")
+        print(f"[Compile] Generated Rust ({len(rust_source)} chars), Used Columns: {used_columns}")
 
         try:
             wasm_bytes = await asyncio.to_thread(compile_to_wasm, rust_source)
-            return rust_source, wasm_bytes
+            return rust_source, wasm_bytes, used_columns
         except RuntimeError as e:
             last_error = str(e)
             print(f"[Compile] Attempt {attempt} failed:\n{last_error[:500]}")
 
             if attempt < MAX_RETRY_ATTEMPTS:
                 # Feed the error back so the LLM can self-correct
-                messages.append(HumanMessage(content=rust_source))  # show what it wrote
+                messages.append(HumanMessage(content=json.dumps({"rust_source": rust_source, "used_columns": used_columns})))
                 messages.append(HumanMessage(content=f"""COMPILATION FAILED with this error:
 
 {last_error}
@@ -416,7 +456,7 @@ Fix the Rust code. Common causes:
 3. `serde_wasm_bindgen::from_value::<Vec<JsValue>>(...)` — Vec<JsValue> doesn't impl Deserialize
 4. `use core::arch::wasm32::*` — use `std::arch::wasm32::*` instead
 
-Output ONLY the corrected Rust code."""))
+Output the JSON object again with the corrected `rust_source` and the same `used_columns`."""))
 
     raise RuntimeError(f"Compilation failed after {MAX_RETRY_ATTEMPTS} attempts:\n{last_error}")
 
@@ -450,7 +490,7 @@ async def compile_pipeline(req: CompileRequest):
         print(f"[Compile] Column types: {col_types}")
 
     try:
-        rust_source, wasm_bytes = await generate_and_compile(
+        rust_source, wasm_bytes, used_columns = await generate_and_compile(
             req.js_code, req.ops, sample_rows, col_names, col_types, lib_rs_context
         )
     except RuntimeError as e:
@@ -469,6 +509,7 @@ async def compile_pipeline(req: CompileRequest):
         message=f"Compiled {len(wasm_bytes)} bytes of WASM",
         col_names=col_names,
         col_types=col_types,
+        used_columns=used_columns,
     )
 
     wasm_cache[cache_key] = result.model_dump()

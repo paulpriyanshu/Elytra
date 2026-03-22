@@ -1,33 +1,34 @@
 import type { Op } from "./dataset";
 import { tableFromIPC } from "apache-arrow";
 
-let parquet: any = null;
-let parquetInitialized = false;
+let ioWorkers: Worker[] = [];
+let ioWorkerIdx = 0;
+let ioJobCounter = 0;
+const pendingIoJobs = new Map<number, { resolve: Function, reject: Function }>();
 
-let parquetPromise: Promise<any> | null = null;
-let parquetLock: Promise<void> = Promise.resolve();
-const parquetFileCache = new Map<string, any>(); // URL -> ParquetFile instance
-
-async function initParquet() {
-    if (typeof window === "undefined") return; // Skip SSR
-    if (parquetPromise) return parquetPromise;
-
-    parquetPromise = (async () => {
-        // Dynamic import to avoid SSR build issues and use the browser version
-        const p = await import("parquet-wasm/esm/parquet_wasm.js");
-        try {
-            await p.default();
-            parquet = p;
-            parquetInitialized = true;
-            return p;
-        } catch (e) {
-            console.warn("Parquet WASM init error:", e);
-            parquetPromise = null; // Reset on failure
-            throw e;
+function getIoWorker() {
+    if (typeof window === "undefined") return null;
+    if (ioWorkers.length === 0) {
+        const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+        // Use roughly 50% of cores for IO, capped at 2 for mobile, at least 2 for desktop
+        const poolSize = isMobile ? 2 : Math.max(2, Math.floor((navigator.hardwareConcurrency || 4) / 2));
+        for (let i = 0; i < poolSize; i++) {
+            const w = new Worker(new URL("./workers/io.worker", import.meta.url), { type: "module" });
+            w.onmessage = (e) => {
+                const { id, ok, buffer, rowCount, error } = e.data;
+                const job = pendingIoJobs.get(id);
+                if (job) {
+                    pendingIoJobs.delete(id);
+                    if (ok) job.resolve({ buffer, rowCount });
+                    else job.reject(new Error(error));
+                }
+            };
+            ioWorkers.push(w);
         }
-    })();
-
-    return parquetPromise;
+    }
+    const w = ioWorkers[ioWorkerIdx];
+    ioWorkerIdx = (ioWorkerIdx + 1) % ioWorkers.length;
+    return w;
 }
 
 class WorkerPool {
@@ -92,7 +93,7 @@ function getPool() {
         const threads = typeof navigator !== "undefined" ? Math.max(2, navigator.hardwareConcurrency || 4) : 4;
         const isMobile = typeof navigator !== "undefined" && /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
 
-        // Cap mobile threads to avoid OOM crashes (strictly 2 for stability)
+        // Cap mobile threads for maximum stability (strictly 2 for mobile)
         const finalThreads = isMobile ? Math.min(threads, 2) : threads;
 
         console.log(`[Executor] ${isMobile ? "Mobile" : "Desktop"} — pool size: ${finalThreads} threads (cap: ${isMobile ? 2 : "none"})`);
@@ -123,7 +124,7 @@ function runWorker(worker: Worker, payload: any, onProgress?: (msg: any) => void
     });
 }
 
-function mergeResults(partials: any[], ops: Op[]): any {
+export function mergeResults(partials: any[], ops: Op[]): any {
     if (ops.length > 0) {
         const lastOp = ops[ops.length - 1]!;
         if (lastOp.type === "count") {
@@ -145,59 +146,22 @@ function mergeResults(partials: any[], ops: Op[]): any {
 export async function prepareParquetChunk(
     parquetUrl: string,
     rowGroupId: number,
-) {
-    const p = await initParquet();
-    if (!p) throw new Error("Parquet engine not available");
+    usedColumns?: string[]
+): Promise<{ buffer: ArrayBuffer, rowCount?: number }> {
+    const worker = getIoWorker();
+    if (!worker) throw new Error("IO Worker not available outside browser environment");
 
-    // Global lock: prevents concurrent WASM access issues (FnOnce/null pointer errors)
-    // The WASM engine is strictly single-threaded for many operations.
-    const currentLock = parquetLock;
-    let releaseLock!: () => void;
-    parquetLock = new Promise((resolve) => { releaseLock = resolve; });
-    await currentLock;
-
-    let buffer: ArrayBuffer;
-    let rowCount: number;
-    try {
-        let file = parquetFileCache.get(parquetUrl);
-        const fileName = parquetUrl.split("/").pop() || "unknown";
-
-        if (!file) {
-            console.log(`[Parquet] Fetching ${fileName} for row group ${rowGroupId}...`);
-            file = await p.ParquetFile.fromUrl(parquetUrl);
-
-            // Cache eviction: keep only latest 2 files
-            if (parquetFileCache.size >= 2) {
-                const oldestUrl = parquetFileCache.keys().next().value as string | undefined;
-                if (oldestUrl) {
-                    const oldestFile = parquetFileCache.get(oldestUrl);
-                    if (oldestFile?.free) oldestFile.free();
-                    parquetFileCache.delete(oldestUrl);
-                    console.log(`[Parquet] Evicted ${oldestUrl.split("/").pop() || "unknown"} from cache`);
-                }
-            }
-            parquetFileCache.set(parquetUrl, file);
-        } else {
-            console.log(`[Parquet] Cache hit: row group ${rowGroupId} from ${fileName}`);
-        }
-
-        const table = await file.read({ rowGroups: [rowGroupId] });
-        rowCount = table.numRows;
-        const ipcView = table.intoIPCStream();
-        // Slice copies data from WASM memory into JS memory
-        buffer = ipcView.buffer.slice(ipcView.byteOffset, ipcView.byteOffset + ipcView.byteLength);
-
-        // table.free() removed as it was causing "null pointer passed to rust" errors
-    } catch (err: any) {
-        console.error(`[Parquet] Error in row group ${rowGroupId}:`, err);
-        parquetFileCache.delete(parquetUrl);
-        throw err;
-    } finally {
-        // ALWAYS release the lock so the next row group can start its WASM work
-        releaseLock();
-    }
-
-    return { buffer, rowCount };
+    return new Promise((resolve, reject) => {
+        const id = ++ioJobCounter;
+        pendingIoJobs.set(id, { resolve, reject });
+        worker.postMessage({ 
+            id, 
+            url: parquetUrl, 
+            rowGroupId, 
+            usedColumns,
+            origin: window.location.origin
+        });
+    });
 }
 
 export async function executeParquetPipeline(
@@ -206,9 +170,10 @@ export async function executeParquetPipeline(
     ops: Op[],
     onProgress?: (threadId: number, status: string, detail?: any) => void,
     rowCount?: number,
-    wasmBase64?: string
+    wasmBase64?: string,
+    usedColumns?: string[]
 ) {
-    const { buffer, rowCount: detectedRowCount } = await prepareParquetChunk(parquetUrl, rowGroupId);
+    const { buffer, rowCount: detectedRowCount } = await prepareParquetChunk(parquetUrl, rowGroupId, usedColumns);
 
     // executePipeline runs the ACTUAL computation across the worker pool
     return executePipeline(buffer, ops, onProgress, true, rowCount ?? detectedRowCount, wasmBase64);

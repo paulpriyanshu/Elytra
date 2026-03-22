@@ -138,7 +138,7 @@ app.post("/api/register-dataset", async (req, res) => {
                     DELIM=',',
                     SAMPLE_SIZE=-1
                 )) 
-                TO '${outputPath}' (FORMAT 'PARQUET', ROW_GROUP_SIZE 1000000)
+                TO '${outputPath}' (FORMAT 'PARQUET', ROW_GROUP_SIZE 100000)
             `);
 
             console.log(`Conversion took ${((Date.now() - start) / 1000).toFixed(2)}s`);
@@ -244,12 +244,42 @@ wss.on("connection", (ws, req) => {
         console.log(`[Control Plane] Worker connected from ${remoteIp}. Total workers: ${activeWorkers.size}`);
     }
 
-    const isMobile = url.searchParams.get("isMobile") === "true";
+    const userAgent = req.headers["user-agent"] || "";
+    const isMobile = url.searchParams.get("isMobile") === "true" || /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(userAgent);
     (ws as any).isMobile = isMobile;
+
+    if (isMobile) {
+        console.log(`[Control Plane] Mobile worker detected: ${workerId}`);
+    }
 
     ws.on("message", (message) => {
         try {
             const data = JSON.parse(message.toString());
+
+            if (data.type === "chunk_error") {
+                console.error(`[Job ${data.jobId}] Worker ${(ws as any).workerId} reported error on chunk ${data.chunkId}: ${data.error}`);
+                (ws as any).inFlight = Math.max(0, (ws as any).inFlight - 1);
+
+                const job = jobs.get(Number(data.jobId));
+                if (job) {
+                    if (data.error && data.error.includes("too large")) {
+                        console.error(`[Job ${data.jobId}] Terminal error: ${data.error}. Failing job.`);
+                        job.reject(new Error(data.error));
+                        jobs.delete(Number(data.jobId));
+                        return;
+                    }
+
+                    // Re-queue the failed task so another worker can pick it up
+                    const pending = (ws as any).pendingChunks.get(Number(data.jobId)) || [];
+                    const failedTask = pending.find((t: any) => t.chunkId === data.chunkId);
+                    if (failedTask) {
+                        console.log(`[Job ${data.jobId}] Re-queuing failed chunk ${data.chunkId}`);
+                        job.taskQueue.push(failedTask);
+                        (ws as any).pendingChunks.set(Number(data.jobId), pending.filter((t: any) => t.chunkId !== data.chunkId));
+                    }
+                }
+                return;
+            }
 
             if (data.type === "worker_progress") {
                 // Broadcast progress to all controllers
@@ -266,25 +296,75 @@ wss.on("connection", (ws, req) => {
                 return;
             }
 
-            if (data.type === "chunk_result") {
+            (ws as any).pendingChunks = (ws as any).pendingChunks || new Map<number, any[]>();
+
+            if (data.type === "refill_request") {
+                const job = jobs.get(data.jobId);
+                if (!job || job.taskQueue.length === 0) return;
+
+                const isMobile = (ws as any).isMobile;
+                const refillSize = Math.min(job.taskQueue.length, isMobile ? 8 : 20);
+                const batchTasks = job.taskQueue.splice(0, refillSize);
+                
+                (ws as any).inFlight += refillSize;
+                const pending = (ws as any).pendingChunks.get(data.jobId) || [];
+                pending.push(...batchTasks);
+                (ws as any).pendingChunks.set(data.jobId, pending);
+
+                ws.send(JSON.stringify({
+                    type: "execute_parquet_batch",
+                    jobId: data.jobId,
+                    ops: job.ops, // Send ops ONCE per batch
+                    wasmBase64: (batchTasks[0] as any).wasmBase64, // Send WASM once per batch if exists
+                    tasks: batchTasks.map(t => ({
+                        chunkId: t.chunkId,
+                        rowGroupId: t.rowGroupId,
+                        parquetUrl: t.parquetUrl,
+                        rowCount: t.rowCount || 0
+                        // ops removed to stay lightweight
+                    })),
+                    remainingTasks: job.taskQueue.length
+                }));
+                return;
+            }
+
+            if (data.type === "batch_result") {
                 const job = jobs.get(data.jobId);
                 if (!job) return;
-                job.partials[data.chunkId] = data.result;
-                job.completedChunks++;
-                (ws as any).inFlight--;
 
-                // Assign next tasks from queue to maintain a buffer of ~6
-                const TARGET_BUFFER = 6;
-                while (job.taskQueue.length > 0 && (ws as any).inFlight < TARGET_BUFFER) {
-                    const nextTask = job.taskQueue.shift();
-                    (ws as any).taskCount++;
-                    (ws as any).inFlight++;
-                    console.log(`[Job ${data.jobId}] Worker ${(ws as any).workerId} refill: chunk ${nextTask.chunkId}. In-flight: ${(ws as any).inFlight}. Queue: ${job.taskQueue.length}`);
+                job.partials.push(data.result);
+                const completeCount = data.chunkIds.length;
+                job.completedChunks += completeCount;
+                (ws as any).inFlight -= completeCount;
+
+                // Remove from local tracker
+                const pending = (ws as any).pendingChunks.get(data.jobId) || [];
+                (ws as any).pendingChunks.set(data.jobId, pending.filter((t: any) => !data.chunkIds.includes(t.chunkId)));
+
+                // Reactive Refill: Only trigger if we aren't already pushing too much
+                const isMobile = (ws as any).isMobile;
+                const TARGET_MIN_BUFFER = isMobile ? 5 : 20;
+                if (job.taskQueue.length > 0 && (ws as any).inFlight < TARGET_MIN_BUFFER) {
+                    const refillSize = Math.min(job.taskQueue.length, isMobile ? 10 : 20);
+                    const batchTasks = job.taskQueue.splice(0, refillSize);
+                    
+                    (ws as any).inFlight += refillSize;
+                    const p = (ws as any).pendingChunks.get(data.jobId) || [];
+                    p.push(...batchTasks);
+                    (ws as any).pendingChunks.set(data.jobId, p);
+
                     ws.send(JSON.stringify({
-                        type: "execute_parquet_chunk",
-                        rowCount: nextTask.rowCount || 0,
-                        remainingTasks: job.taskQueue.length,
-                        ...nextTask
+                        type: "execute_parquet_batch",
+                        jobId: data.jobId,
+                        ops: job.ops,
+                        wasmBase64: (batchTasks[0] as any).wasmBase64,
+                        tasks: batchTasks.map(t => ({
+                            chunkId: t.chunkId,
+                            rowGroupId: t.rowGroupId,
+                            parquetUrl: t.parquetUrl,
+                            rowCount: t.rowCount || 0
+                        })),
+                        remainingTasks: job.taskQueue.length
                     }));
                 }
 
@@ -294,7 +374,7 @@ wss.on("connection", (ws, req) => {
                     jobId: data.jobId,
                     workerId: (ws as any).workerId,
                     taskCount: (ws as any).taskCount,
-                    lastChunkId: data.chunkId,
+                    lastChunkId: data.chunkIds[data.chunkIds.length - 1],
                     status: "done"
                 });
                 activeControllers.forEach(controller => {
@@ -303,11 +383,12 @@ wss.on("connection", (ws, req) => {
                     }
                 });
 
-                if (job.completedChunks === job.expectedChunks) {
+                if (job.completedChunks >= job.expectedChunks) {
                     const finalResult = mergeResults(job.partials, job.ops);
                     job.resolve(finalResult);
                     jobs.delete(data.jobId);
                 }
+                return;
             }
         } catch (e) { }
     });
@@ -319,6 +400,18 @@ wss.on("connection", (ws, req) => {
         } else {
             activeWorkers.delete(ws);
             console.log(`[Control Plane] Worker disconnected. Total workers: ${activeWorkers.size}`);
+            
+            // TASK RE-ASSIGNMENT: If worker had tasks in flight, put them back in the queue
+            const pendingJobs = (ws as any).pendingChunks as Map<number, any[]>;
+            if (pendingJobs) {
+                pendingJobs.forEach((tasks, jobId) => {
+                    const job = jobs.get(jobId);
+                    if (job) {
+                        console.log(`[Job ${jobId}] Re-queueing ${tasks.length} tasks from disconnected worker.`);
+                        job.taskQueue.push(...tasks);
+                    }
+                });
+            }
         }
     });
 
@@ -372,6 +465,7 @@ app.post("/api/jobs", async (req, res) => {
             jobId,
             chunkId: idx,
             rowGroupId: rg.id,
+            rowCount: rg.rowCount,
             parquetUrl: `${R2_PUBLIC_URL}/${dataset.s3Key}`,
             ops,
             ...(wasmBase64 ? { wasmBase64 } : {})
@@ -382,34 +476,43 @@ app.post("/api/jobs", async (req, res) => {
 
             jobs.set(jobId, {
                 resolve, reject, ops,
-                partials: new Array(tasks.length),
+                partials: [],
                 expectedChunks: tasks.length,
                 completedChunks: 0,
                 taskQueue: tasks.slice(workers.length) // Remaining tasks
             });
 
-            // Initial assignment: Give a batch of tasks to each worker (pre-fill pipeline)
-            const INITIAL_BATCH_SIZE = 6;
-            console.log(`[Job ${jobId}] Starting job with ${tasks.length} tasks and ${workers.length} workers. Batch size: ${INITIAL_BATCH_SIZE}`);
-
+            // Initial assignment: Scale by device type
             let taskIdx = 0;
             workers.forEach((worker) => {
-                for (let i = 0; i < INITIAL_BATCH_SIZE; i++) {
-                    const task = tasks[taskIdx++];
-                    if (!task) break;
+                (worker as any).pendingChunks = (worker as any).pendingChunks || new Map<number, any[]>();
+                
+                const isWorkerMobile = (worker as any).isMobile;
+                const batchSize = Math.min(tasks.length - taskIdx, isWorkerMobile ? 12 : 64);
+                if (batchSize <= 0) return;
 
-                    (worker as any).taskCount++;
-                    (worker as any).inFlight = ((worker as any).inFlight || 0) + 1;
+                const batchTasks = tasks.slice(taskIdx, taskIdx + batchSize);
+                taskIdx += batchSize;
 
-                    const chunkMeta = dataset.rowGroups[task.chunkId];
-                    worker.send(JSON.stringify({
-                        type: "execute_parquet_chunk",
-                        rowCount: chunkMeta ? chunkMeta.rowCount : 0,
-                        remainingTasks: tasks.length - taskIdx,
-                        ...task
-                    }));
-                }
-                console.log(`[Job ${jobId}] Assigned initial batch to ${(worker as any).workerId}: ${(worker as any).inFlight} tasks.`);
+                (worker as any).taskCount += batchSize;
+                (worker as any).inFlight += batchSize;
+                (worker as any).pendingChunks.set(jobId, batchTasks);
+
+                worker.send(JSON.stringify({
+                    type: "execute_parquet_batch",
+                    jobId,
+                    ops: (batchTasks[0] as any).ops,
+                    wasmBase64: (batchTasks[0] as any).wasmBase64,
+                    tasks: batchTasks.map(t => ({
+                        chunkId: t.chunkId,
+                        rowGroupId: t.rowGroupId,
+                        parquetUrl: t.parquetUrl,
+                        rowCount: t.rowCount || 0
+                    })),
+                    remainingTasks: tasks.length - taskIdx
+                }));
+
+                console.log(`[Job ${jobId}] Assigned initial batch of ${batchSize} to ${(worker as any).workerId} (isMobile: ${isWorkerMobile})`);
             });
 
             // Update job taskQueue
@@ -419,7 +522,18 @@ app.post("/api/jobs", async (req, res) => {
             }
         });
 
-        res.json({ result });
+        try {
+            res.json({ result });
+        } catch (err: any) {
+            if (err.name === "RangeError" && err.message.includes("string length")) {
+                console.error(`[Job ${jobId}] Final result too large to stringify (${Array.isArray(result) ? result.length : "unknown"} items)`);
+                res.status(500).json({ 
+                    error: "Result too large to transmit. The aggregated result exceeds the JSON string length limit. Consider using a terminal operation like .count(), .sum(), or more restrictive .filter() to reduce result size." 
+                });
+            } else {
+                throw err;
+            }
+        }
     } catch (e: any) {
         res.status(500).json({ error: e.message });
     }

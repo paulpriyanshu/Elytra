@@ -221,9 +221,9 @@ return result;`;
 
     /**
      * Calls the Python FastAPI server to compile user JS to WASM via LLM.
-     * Returns wasmBase64 string or null if compilation fails/skipped.
+     * Returns wasmBase64 string and usedColumns array or null if compilation fails/skipped.
      */
-    async function compileToWasm(jsCode: string, ops: any[], parquetUrl?: string): Promise<string | null> {
+    async function compileToWasm(jsCode: string, ops: any[], parquetUrl?: string): Promise<{wasmBase64: string, usedColumns: string[]} | null> {
         try {
             addNetworkLog("🦀 Compiling JS → Rust (LLM)...", "info");
             const res = await fetch(`${llmServerUrl}/compile`, {
@@ -245,7 +245,10 @@ return result;`;
 
             const data = await res.json();
             addNetworkLog(`✅ WASM compiled (${Math.round(data.wasm_base64.length * 0.75 / 1024)}KB). Running with Rust kernel.`, "info");
-            return data.wasm_base64;
+            return {
+                wasmBase64: data.wasm_base64,
+                usedColumns: data.used_columns || []
+            };
         } catch (e: any) {
             addNetworkLog(`⚠️ LLM server unreachable: ${e.message}. Running in JS mode.`, "info");
             return null;
@@ -329,7 +332,8 @@ return result;`;
             } catch (_) { /* dry-run may throw for some patterns, that's OK */ }
 
             // ── Step 2: Compile to WASM via LLM (Python server) ────────────────
-            let wasmBase64: string | null = null;
+            let wasmBase64: string | undefined = undefined;
+            let usedColumns: string[] | undefined = undefined;
             const needsCompilation = capturedOps.some(op =>
                 op.type === "map" ||
                 op.type === "filter" ||
@@ -337,7 +341,12 @@ return result;`;
             );
 
             if (datasetId && capturedOps.length > 0 && needsCompilation) {
-                wasmBase64 = await compileToWasm(code, capturedOps, capturedParquetUrl);
+                const cmp = await compileToWasm(code, capturedOps, capturedParquetUrl);
+                if (cmp) {
+                    wasmBase64 = cmp.wasmBase64;
+                    usedColumns = cmp.usedColumns;
+                    if (usedColumns.length > 0) addNetworkLog(`🔍 Extracted columns: ${usedColumns.join(", ")}`, "info");
+                }
             } else if (capturedOps.length > 0 && !needsCompilation) {
                 addNetworkLog("⚡ Skipping LLM: All operations are pre-compiled in lib.rs", "info");
             }
@@ -346,7 +355,7 @@ return result;`;
             // Patch .distribute() call to pass the wasmBase64 arg
             const codeWithWasm = code.replace(
                 /\.distribute\(\)/g,
-                `.distribute("playground-key", ${JSON.stringify(wasmBase64)})`
+                `.distribute("playground-key", ${JSON.stringify(wasmBase64)}, ${JSON.stringify(usedColumns)})`
             );
             const executor = new Function("Elytra", "currentDatasetId", `
                 return (async () => {

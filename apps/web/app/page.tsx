@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect } from "react";
-import { Elytra, executePipeline, executeParquetPipeline, prepareParquetChunk } from "@elytra/runtime";
+import { Elytra, executePipeline, executeParquetPipeline, prepareParquetChunk, mergeResults } from "@elytra/runtime";
 import styles from "./page.module.css";
 
 export default function Page() {
@@ -56,68 +56,84 @@ export default function Page() {
     const decodeQueue: any[] = []; // Decoded buffers ready for compute
     const resultQueue: any[] = []; // Computed results ready for upload
 
-    const hwThreads = navigator.hardwareConcurrency || 4;
-    const MAX_CONCURRENT_TASKS = isMobile ? Math.min(hwThreads, 4) : hwThreads;
-    const MAX_DECODE_QUEUE = isMobile ? 1 : 8; // Increased for desktop to fill 12+ thread pools
+    const baseHwThreads = navigator.hardwareConcurrency || 4;
+    const MAX_CONCURRENT_TASKS = isMobile ? 2 : baseHwThreads;
+    const MAX_DECODE_QUEUE = isMobile ? 2 : Math.max(MAX_CONCURRENT_TASKS * 2, 8); // Deep queue for desktop, small for mobile
 
     let activeComputeCount = 0;
-    let isDecoding = false;
+    let activeDecodeCount = 0;
     let isUploading = false;
     let serverBacklog = 0;
-
+    let currentJobId: string | null = null; 
+    let refillInFlight = false; // Guard to prevent spamming refills
     const updateQSizes = () => {
-      setQSizes({
+      const q = {
         jobs: jobQueue.length,
         decode: decodeQueue.length,
         results: resultQueue.length,
         active: activeComputeCount,
         backlog: serverBacklog
-      });
+      };
+      setQSizes(q);
+
+      // PREFETCH LOGIC: Request refill if queue is low, but only if one isn't already coming
+      const REFILL_THRESHOLD = isMobile ? 4 : 10;
+      if (ws.readyState === WebSocket.OPEN && jobQueue.length < REFILL_THRESHOLD && serverBacklog > 0 && currentJobId && !refillInFlight) {
+        refillInFlight = true;
+        ws.send(JSON.stringify({ type: "refill_request", jobId: Number(currentJobId) }));
+        
+        // Anti-deadlock: If refill doesn't arrive in 8s, allow another attempt
+        setTimeout(() => { refillInFlight = false; }, 8000);
+      }
     };
 
     if (isMobile) {
       addLog(`Node running mobile-optimized mode (${MAX_CONCURRENT_TASKS} concurrent compute jobs)`);
     } else {
-      addLog(`Node ready: ${MAX_CONCURRENT_TASKS} concurrent compute jobs (${hwThreads} hardware threads)`);
+      addLog(`Node ready: ${MAX_CONCURRENT_TASKS} concurrent compute jobs (${baseHwThreads} hardware threads)`);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
     // STAGE A: Decode (Producer 1)
     // ─────────────────────────────────────────────────────────────────────────
     const processDecodeQueue = async () => {
-      if (isDecoding || jobQueue.length === 0 || decodeQueue.length >= MAX_DECODE_QUEUE) return;
+      // Memory Guard: If we already have enough decoded chunks waiting for compute, don't decode more.
+      // On mobile, we only want 1-2 chunks in RAM at most.
+      const TOTAL_MEMORY_CAP = isMobile ? 2 : Math.max(MAX_CONCURRENT_TASKS * 2, 4);
+      if (jobQueue.length === 0 || activeDecodeCount >= MAX_DECODE_QUEUE || (decodeQueue.length + activeDecodeCount) >= TOTAL_MEMORY_CAP) return;
 
-      isDecoding = true;
-      const { message, ws } = jobQueue.shift();
-      updateQSizes();
+      while (jobQueue.length > 0 && activeDecodeCount < MAX_DECODE_QUEUE && (decodeQueue.length + activeDecodeCount) < TOTAL_MEMORY_CAP) {
+        activeDecodeCount++;
+        const { message, ws } = jobQueue.shift();
+        updateQSizes();
 
-      try {
-        if (message.type === "execute_parquet_chunk") {
-          addLog(`[Stage A] Decoding chunk ${message.chunkId}...`);
-          const { buffer, rowCount } = await prepareParquetChunk(message.parquetUrl, message.rowGroupId);
-          decodeQueue.push({ ...message, buffer, rowCount: message.rowCount || rowCount, ws });
-          addLog(`[Stage A] Decoded chunk ${message.chunkId}. Queue size: ${decodeQueue.length}`);
-          updateQSizes();
-        } else {
-          decodeQueue.push({ ...message, ws });
-        }
+        (async () => {
+          try {
+            if (message.type === "execute_parquet_chunk") {
+              addLog(`[Stage A] Decoding chunk ${message.chunkId}...`);
+              const { buffer, rowCount } = await prepareParquetChunk(message.parquetUrl, message.rowGroupId, message.usedColumns);
+              decodeQueue.push({ ...message, buffer, rowCount: message.rowCount || rowCount, ws });
+              addLog(`[Stage A] Decoded chunk ${message.chunkId}. Queue size: ${decodeQueue.length}`);
+              updateQSizes();
+            } else {
+              decodeQueue.push({ ...message, ws });
+            }
 
-        // Trigger next stages
-        processComputeQueue();
-
-        // Check if we can decode more (up to MAX_DECODE_QUEUE)
-        isDecoding = false;
-        processDecodeQueue();
-      } catch (error) {
-        addLog(`[Stage A] Error decoding chunk ${message.chunkId}: ${error}`);
-        ws.send(JSON.stringify({
-          type: "chunk_error",
-          jobId: message.jobId,
-          chunkId: message.chunkId,
-          error: (error as Error).message
-        }));
-        isDecoding = false;
-        processDecodeQueue();
+            processComputeQueue();
+            activeDecodeCount--;
+            processDecodeQueue();
+          } catch (error) {
+            addLog(`[Stage A] Error decoding chunk ${message.chunkId}: ${error}`);
+            ws.send(JSON.stringify({
+              type: "chunk_error",
+              jobId: message.jobId,
+              chunkId: message.chunkId,
+              error: (error as Error).message
+            }));
+            activeDecodeCount--;
+            processDecodeQueue();
+          }
+        })();
       }
     };
 
@@ -170,9 +186,8 @@ export default function Page() {
               : await executePipeline(message.data, message.ops, progressCb, false, undefined, message.wasmBase64);
 
             addLog(`[Stage B] Completed compute: chunk ${message.chunkId}`);
-            resultQueue.push({ jobId: message.jobId, chunkId: message.chunkId, result, ws: message.ws });
+            resultQueue.push({ jobId: message.jobId, chunkId: message.chunkId, result, ws: message.ws, ops: message.ops });
             updateQSizes();
-            processUploadQueue();
           } catch (error) {
             addLog(`[Stage B] Error in chunk ${message.chunkId}: ${error}`);
             ws.send(JSON.stringify({
@@ -185,6 +200,7 @@ export default function Page() {
             activeComputeCount--;
             updateQSizes();
             processComputeQueue(); // Try to pick up next compute job
+            processUploadQueue();
           }
         })();
       }
@@ -193,22 +209,71 @@ export default function Page() {
     // ─────────────────────────────────────────────────────────────────────────
     // STAGE C: Upload (Consumer 2)
     // ─────────────────────────────────────────────────────────────────────────
-    const processUploadQueue = async () => {
-      if (isUploading || resultQueue.length === 0) return;
+    const resultBatchBuffer = new Map<number, { ws: WebSocket, ops: any[], chunkIds: number[], partials: any[], timer?: ReturnType<typeof setTimeout> }>();
 
-      isUploading = true;
-      while (resultQueue.length > 0) {
-        const { jobId, chunkId, result, ws } = resultQueue.shift();
-        updateQSizes();
-        addLog(`[Stage C] Uploading chunk ${chunkId}...`);
-        ws.send(JSON.stringify({
-          type: "chunk_result",
+    const flushBatch = (jobId: number) => {
+      const batch = resultBatchBuffer.get(jobId);
+      if (!batch || batch.chunkIds.length === 0) return;
+
+      if (batch.timer) clearTimeout(batch.timer);
+      batch.timer = undefined;
+
+      try {
+        const merged = mergeResults(batch.partials, batch.ops);
+        const payload = JSON.stringify({
+          type: "batch_result",
           jobId,
-          chunkId,
-          result
+          chunkIds: batch.chunkIds,
+          result: merged
+        });
+        batch.ws.send(payload);
+      } catch (error: any) {
+        addLog(`[Stage C] Upload failed for batch [${batch.chunkIds.join(", ")}]: ${error.message}`);
+        batch.ws.send(JSON.stringify({
+          type: "chunk_error",
+          jobId,
+          chunkId: batch.chunkIds[0], // Use first chunk as reference
+          error: error.name === "RangeError" && error.message.includes("string length")
+            ? "Result too large to transmit via WebSocket. Consider using .count() or .sum() for large datasets."
+            : `Upload error: ${error.message}`
         }));
       }
-      isUploading = false;
+
+      batch.chunkIds = [];
+      batch.partials = [];
+    };
+
+    const processUploadQueue = async () => {
+      if (isUploading) return;
+      isUploading = true;
+
+      try {
+        while (resultQueue.length > 0) {
+          const { jobId, chunkId, result, ws, ops } = resultQueue.shift();
+
+          if (!resultBatchBuffer.has(jobId)) {
+            resultBatchBuffer.set(jobId, { ws, ops: ops || [], chunkIds: [], partials: [] });
+          }
+          const batch = resultBatchBuffer.get(jobId)!;
+          batch.chunkIds.push(chunkId);
+          batch.partials.push(result);
+
+          updateQSizes();
+
+          const FLUSH_SIZE = 10;
+          if (batch.timer) clearTimeout(batch.timer);
+
+          const completelyDone = serverBacklog === 0 && jobQueue.length === 0 && decodeQueue.length === 0 && activeComputeCount === 0 && resultQueue.length === 0;
+
+          if (batch.chunkIds.length >= FLUSH_SIZE || completelyDone) {
+            flushBatch(jobId);
+          } else {
+            batch.timer = setTimeout(() => flushBatch(jobId), 500); // Flush after 500ms of inactivity
+          }
+        }
+      } finally {
+        isUploading = false;
+      }
     };
 
     ws.onmessage = async (event) => {
@@ -216,8 +281,29 @@ export default function Page() {
 
       if (message.type === "execute_chunk" || message.type === "execute_parquet_chunk") {
         addLog(`Enqueued job ${message.jobId} (Chunk ${message.chunkId})`);
+        currentJobId = message.jobId;
         serverBacklog = message.remainingTasks || 0;
         jobQueue.push({ message, ws });
+        updateQSizes();
+        processDecodeQueue();
+      } else if (message.type === "execute_parquet_batch") {
+        addLog(`Enqueued batch of ${message.tasks.length} chunks`);
+        currentJobId = message.jobId;
+        serverBacklog = message.remainingTasks || 0;
+        refillInFlight = false; // Reset guard when we receive work
+        
+        message.tasks.forEach((task: any) => {
+          jobQueue.push({ 
+            message: { 
+              ...task, 
+              type: "execute_parquet_chunk", 
+              jobId: message.jobId,
+              ops: message.ops, // Inherit from batch level
+              wasmBase64: message.wasmBase64 // Inherit from batch level
+            }, 
+            ws 
+          });
+        });
         updateQSizes();
         processDecodeQueue();
       }

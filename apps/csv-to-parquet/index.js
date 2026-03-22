@@ -52,9 +52,10 @@ async function run() {
 
     try {
         // Core conversion logic (matches server/src/index.ts:125-128)
+        const readFunc = inputPath.toLowerCase().includes('parquet') ? 'read_parquet' : 'read_csv_auto';
         await db.all(`
-            COPY (SELECT * FROM read_csv_auto('${inputPath}')) 
-            TO '${outputPath}' (FORMAT 'PARQUET', ROW_GROUP_SIZE 1000000)
+            COPY (SELECT * FROM ${readFunc}('${inputPath}')) 
+            TO '${outputPath}' (FORMAT 'PARQUET', ROW_GROUP_SIZE 100000)
         `);
 
         const end = Date.now();

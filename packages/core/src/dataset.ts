@@ -83,13 +83,14 @@ export class Dataset<T> {
         return executePipeline(this.data, this.ops);
     }
 
-    async distribute(apiKey: string = "playground-key", wasmBase64?: string) {
+    async distribute(apiKey: string = "playground-key", wasmBase64?: string, usedColumns?: string[]) {
         const { result } = await Elytra.run({
             apiKey,
             data: this.data,
             datasetId: this.datasetId,
             pipeline: () => this,
-            wasmBase64
+            wasmBase64,
+            usedColumns
         });
         return result;
     }
@@ -177,7 +178,8 @@ export class Elytra {
         data?: any[],
         datasetId?: string,
         pipeline: (d: Dataset<any>) => Dataset<T>,
-        wasmBase64?: string
+        wasmBase64?: string,
+        usedColumns?: string[]
     }) {
         const initialDataset = new Dataset<any>([]);
         const finalDataset = config.pipeline(initialDataset);
@@ -193,7 +195,8 @@ export class Elytra {
                 data: config.data,
                 datasetId: config.datasetId,
                 ops: ops,
-                ...(config.wasmBase64 ? { wasmBase64: config.wasmBase64 } : {})
+                ...(config.wasmBase64 ? { wasmBase64: config.wasmBase64 } : {}),
+                ...(config.usedColumns && config.usedColumns.length > 0 ? { usedColumns: config.usedColumns } : {})
             })
         });
 
